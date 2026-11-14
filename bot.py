@@ -1,15 +1,23 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
 import json
 import os
-import random
 import re
+import time
+from datetime import datetime, timedelta, timezone
 from threading import Thread
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
+
+# =========================================================
+# GEREKSINIMLER: discord.py>=2.4 , flask
+# Developer Portal'da: SERVER MEMBERS + MESSAGE CONTENT intent ACIK olmali.
+# Botu davet ederken scope: bot + applications.commands
+# Bot yetkileri: Administrator (veya en az Audit Log, Ban, Manage Roles/Channels)
+# Bot rolu sunucudaki en ust rollerden biri olmali.
+# =========================================================
 
 # ---------------------------------------------------------
 # 1. KEEP-ALIVE FLASK SUNUCUSU (RENDER WEB SERVICE)
@@ -34,31 +42,59 @@ def keep_alive():
 
 
 # ---------------------------------------------------------
-# 2. VERİTABANI VE AYAR YÖNETİMİ (JSON)
+# 2. VERITABANI (JSON + RAM CACHE -> diske her kontrolde gitmez, hizli)
 # ---------------------------------------------------------
 WHITELIST_FILE = 'whitelist_data.json'
+_wl_cache = None
 
 
 def load_whitelist():
-    if not os.path.exists(WHITELIST_FILE):
-        return {}
+    global _wl_cache
+    if _wl_cache is None:
+        if os.path.exists(WHITELIST_FILE):
+            try:
+                with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
+                    _wl_cache = json.load(f)
+            except Exception:
+                _wl_cache = {}
+        else:
+            _wl_cache = {}
+    return _wl_cache
+
+
+def save_whitelist(data=None):
+    global _wl_cache
+    if data is not None:
+        _wl_cache = data
     try:
-        with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        with open(WHITELIST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(_wl_cache, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f'Whitelist kaydedilemedi: {e}')
 
 
-def save_whitelist(data):
-    with open(WHITELIST_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-
-def is_whitelisted(
-    guild_id: int, user: discord.Member | discord.User, category: str
-) -> bool:
+def ayar_getir(guild_id: int) -> dict:
     data = load_whitelist()
-    guild_data = data.get(str(guild_id), {})
+    g = data.setdefault(str(guild_id), {})
+    degisti = False
+    for anahtar, varsayilan in (
+        ('users', {}),
+        ('roles', {}),
+        ('log_channel_id', None),
+        ('gelen_giden_kanal', None),
+        ('otorol_id', None),
+        ('guard', True),
+    ):
+        if anahtar not in g:
+            g[anahtar] = varsayilan
+            degisti = True
+    if degisti:
+        save_whitelist()
+    return g
+
+
+def is_whitelisted(guild_id: int, user, category: str) -> bool:
+    guild_data = load_whitelist().get(str(guild_id), {})
 
     user_perms = guild_data.get('users', {}).get(str(user.id), [])
     if 'All' in user_perms or category in user_perms:
@@ -70,33 +106,42 @@ def is_whitelisted(
             r_perms = roles_data.get(str(role.id), [])
             if 'All' in r_perms or category in r_perms:
                 return True
-
     return False
 
 
 # ---------------------------------------------------------
-# 3. BOT INTENTLERİ VE DEĞİŞKENLERİ
+# 3. BOT TANIMI
 # ---------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.invites = True
-
-bot = commands.Bot(command_prefix='!', intents=intents)
+intents.moderation = True  # audit log olaylari (on_audit_log_entry_create) icin
 
 BOT_SAHIBI_ID = 1451263034541604997
 
-guvenlik_aktif = True
-sunucu_ayarlari = {}
+
+class GuardBot(commands.Bot):
+
+    async def setup_hook(self):
+        # Restart sonrasi ticket butonlari calismaya devam etsin
+        self.add_view(TicketView())
+        self.add_view(TicketKapatView())
+
+
+bot = GuardBot(command_prefix='!', intents=intents)
+
 davet_hafizasi = {}
+silinen_kanallar = {}
+silinen_roller = {}
+cezali_kullanicilar = set()
 
 kanal_silme_gecmisi = {}
 kanal_olusturma_gecmisi = {}
 rol_silme_gecmisi = {}
 rol_olusturma_gecmisi = {}
-perm_cekme_gecmisi = {}
-etiket_spam_gecmisi = {}
-link_spam_gecmisi = {}
+ban_gecmisi = {}
+kick_gecmisi = {}
 mesaj_gecmisi = {}
 
 TICKET_KANAL_KEYWORDS = [
@@ -119,153 +164,36 @@ LINK_REGEX = re.compile(
 )
 
 
-def ayar_getir(guild_id: int):
-    data = load_whitelist()
-    g_id = str(guild_id)
-    if g_id not in data:
-        data[g_id] = {
-            'users': {},
-            'roles': {},
-            'log_channel_id': None,
-            'gelen_giden_kanal': None,
-            'otorol_id': None,
-        }
-        save_whitelist(data)
-    return data[g_id]
+def simdi():
+    return datetime.now(timezone.utc)
 
 
-# ---------------------------------------------------------
-# 4. ERENSİ TARZI MERKEZİ LOG GÖNDERİCİ
-# ---------------------------------------------------------
-async def erensi_log_gonder(guild: discord.Guild, embed: discord.Embed):
-    if not guild:
-        return
-
-    data = load_whitelist()
-    log_channel_id = data.get(str(guild.id), {}).get('log_channel_id')
-
-    target_channel = None
-    if log_channel_id:
-        target_channel = guild.get_channel(log_channel_id)
-
-    if not target_channel:
-        target_channel = discord.utils.find(
-            lambda c: 'log' in c.name.lower()
-            and isinstance(c, discord.TextChannel),
-            guild.channels,
-        )
-
-    if target_channel:
-        try:
-            await target_channel.send(embed=embed)
-        except Exception as e:
-            print(f'Log atılamadı: {e}')
+def guard_aktif(guild_id: int) -> bool:
+    return ayar_getir(guild_id).get('guard', True)
 
 
-async def ceza_uygula(
-    guild: discord.Guild,
-    user: discord.Member,
-    sebep: str,
-    action_category: str = 'All',
-    target_name: str = 'Sunucu Yapısı',
-):
-    if (
-        user == guild.owner
-        or user.bot
-        or user == bot.user
-        or user.id == BOT_SAHIBI_ID
-        or is_whitelisted(guild.id, user, action_category)
-    ):
-        return
+def limit_asildi(gecmis: dict, key, limit: int, sure: float) -> bool:
+    t = time.monotonic()
+    liste = [x for x in gecmis.get(key, []) if t - x < sure]
+    liste.append(t)
+    gecmis[key] = liste
+    return len(liste) >= limit
 
-    alinacak_roller = [
-        role
-        for role in user.roles
-        if role.permissions.administrator
-        or role.permissions.manage_roles
-        or role.permissions.manage_channels
-    ]
 
-    if alinacak_roller:
-        try:
-            await user.remove_roles(
-                *alinacak_roller, reason=f'GUARD/ANTI-RAID: {sebep}'
-            )
-        except Exception as e:
-            print(f'Rol çekme hatası: {e}')
-
-    try:
-        await guild.ban(
-            user, reason=f'🚨 Anti-Nuke: {sebep}', delete_message_days=1
-        )
-    except Exception as e:
-        print(f'Banlama yetkisi yetersiz: {e}')
-
-    embed = discord.Embed(
-        title='🚨 • Anti-Nuke Güvenlik Müdahalesi!',
-        color=0x992D22,
-        timestamp=datetime.now(timezone.utc),
+def tehlikeli_rol_mu(role: discord.Role) -> bool:
+    p = role.permissions
+    return (
+        p.administrator
+        or p.manage_roles
+        or p.manage_channels
+        or p.manage_guild
+        or p.ban_members
+        or p.kick_members
+        or p.manage_webhooks
     )
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(
-        name='Kullanıcı:',
-        value=f'{user.mention} (`{user.name}` - `{user.id}`)',
-        inline=False,
-    )
-    embed.add_field(
-        name='İhlal Edilen Kategori:',
-        value=f'`{action_category}`',
-        inline=True,
-    )
-    embed.add_field(name='Sebep:', value=f'```{sebep}```', inline=False)
-    embed.add_field(name='Hedef:', value=f'`{target_name}`', inline=True)
-    embed.add_field(
-        name='Yapılan İşlem:',
-        value='🔴 **YETKİLERİ ALINDI VE BANLANDI**',
-        inline=False,
-    )
-    embed.set_footer(text=f'Kullanıcı ID: {user.id} • Guard Sentinel')
-    await erensi_log_gonder(guild, embed)
 
 
-def whitelist_yetki_ve_hiyerarsi_kontrolu(
-    interaction: discord.Interaction, target_role: discord.Role
-) -> tuple[bool, str]:
-    user = interaction.user
-    guild = interaction.guild
-
-    is_bot_owner = user.id == BOT_SAHIBI_ID
-    is_server_owner = user.id == guild.owner_id
-    is_admin = user.guild_permissions.administrator
-    has_role_cmd_perm = is_whitelisted(
-        guild.id, user, 'Role-Command'
-    ) or is_whitelisted(guild.id, user, 'All')
-
-    if not (is_bot_owner or is_server_owner or is_admin or has_role_cmd_perm):
-        return (
-            False,
-            '❌ Bu komutu kullanabilmek için `/whitelist` listesinde `Rol'
-            ' Verme/Alma Komutu (Role-Command)` yetkisine sahip olman gerekir!',
-        )
-
-    if guild.me.top_role <= target_role:
-        return (
-            False,
-            '❌ Bu rol benim en yüksek rolümden üstte veya eşit olduğu için işlem'
-            ' yapamam! Bot rolünü yukarı taşıyın.',
-        )
-
-    if not (is_bot_owner or is_server_owner) and user.top_role <= target_role:
-        return (
-            False,
-            '❌ Kendi en yüksek rolünüzden daha yüksek veya eşit bir rolü'
-            ' veremezsiniz/alamazsınız!',
-        )
-
-    return True, ''
-
-
-def zaman_donustur(zaman_str: str) -> int:
+def zaman_donustur(zaman_str: str):
     birimler = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
     match = re.match(r'^(\d+)([smhd])$', zaman_str.lower())
     if not match:
@@ -277,13 +205,543 @@ def zaman_donustur(zaman_str: str) -> int:
 async def davetleri_guncelle(guild: discord.Guild):
     try:
         invites = await guild.invites()
-        davet_hafizasi[guild.id] = {invite.code: invite.uses for invite in invites}
+        davet_hafizasi[guild.id] = {i.code: i.uses for i in invites}
     except Exception as e:
         print(f'Davetler alınamadı ({guild.name}): {e}')
 
 
 # ---------------------------------------------------------
-# 5. TICKET VIEWS
+# 4. LOG + CEZA
+# ---------------------------------------------------------
+async def erensi_log_gonder(guild: discord.Guild, embed: discord.Embed):
+    if not guild:
+        return
+
+    log_channel_id = ayar_getir(guild.id).get('log_channel_id')
+    target = guild.get_channel(log_channel_id) if log_channel_id else None
+
+    if not target:
+        target = discord.utils.find(
+            lambda c: 'log' in c.name.lower() and isinstance(c, discord.TextChannel),
+            guild.channels,
+        )
+
+    if target:
+        try:
+            await target.send(embed=embed)
+        except Exception as e:
+            print(f'Log atılamadı: {e}')
+
+
+def muaf_mi(guild: discord.Guild, user, kategori: str) -> bool:
+    return (
+        user.id == guild.owner_id
+        or user.bot
+        or user.id == bot.user.id
+        or user.id == BOT_SAHIBI_ID
+        or is_whitelisted(guild.id, user, kategori)
+    )
+
+
+async def ceza_uygula(
+    guild: discord.Guild,
+    user: discord.Member,
+    sebep: str,
+    action_category: str = 'All',
+    target_name: str = 'Sunucu Yapısı',
+):
+    if muaf_mi(guild, user, action_category):
+        return False
+
+    # Ayni kisiye ust uste ceza/log olmasin
+    if user.id in cezali_kullanicilar:
+        return True
+    cezali_kullanicilar.add(user.id)
+    bot.loop.call_later(30, cezali_kullanicilar.discard, user.id)
+
+    alinacak_roller = [
+        r
+        for r in user.roles
+        if not r.is_default()
+        and not r.managed
+        and r < guild.me.top_role
+        and (
+            r.permissions.administrator
+            or r.permissions.manage_roles
+            or r.permissions.manage_channels
+        )
+    ]
+
+    # Ban ve rol alma AYNI ANDA gider (eskiden sirayla gidiyordu = yavas)
+    gorevler = [
+        guild.ban(
+            user,
+            reason=f'🚨 Anti-Nuke: {sebep}',
+            delete_message_seconds=86400,
+        )
+    ]
+    if alinacak_roller:
+        gorevler.append(
+            user.remove_roles(*alinacak_roller, reason=f'GUARD/ANTI-RAID: {sebep}')
+        )
+    sonuclar = await asyncio.gather(*gorevler, return_exceptions=True)
+    ban_basarili = not isinstance(sonuclar[0], Exception)
+    if not ban_basarili:
+        print(f'Banlanamadı ({user}): {sonuclar[0]} -> bot rolünü yukarı taşı!')
+
+    embed = discord.Embed(
+        title='🚨 • Anti-Nuke Güvenlik Müdahalesi!',
+        color=0x992D22,
+        timestamp=simdi(),
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(
+        name='Kullanıcı:',
+        value=f'{user.mention} (`{user.name}` - `{user.id}`)',
+        inline=False,
+    )
+    embed.add_field(name='İhlal Edilen Kategori:', value=f'`{action_category}`')
+    embed.add_field(name='Sebep:', value=f'```{sebep}```', inline=False)
+    embed.add_field(name='Hedef:', value=f'`{target_name}`')
+    embed.add_field(
+        name='Yapılan İşlem:',
+        value=(
+            '🔴 **YETKİLERİ ALINDI VE BANLANDI**'
+            if ban_basarili
+            else '🟠 **YETKİLERİ ALINDI** (Ban başarısız: bot rolü yetersiz)'
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f'Kullanıcı ID: {user.id} • Guard Sentinel')
+    await erensi_log_gonder(guild, embed)
+    return True
+
+
+async def nuke_denetle(
+    guild, member, kategori, gecmis, limit, sure, sebep, hedef
+) -> bool:
+    """Limit asildiysa cezalandirir. Ceza verildiyse True doner."""
+    if muaf_mi(guild, member, kategori):
+        return False
+    if not limit_asildi(gecmis, (guild.id, member.id), limit, sure):
+        return False
+    return await ceza_uygula(guild, member, sebep, kategori, hedef)
+
+
+# ---------------------------------------------------------
+# 5. ANTI-NUKE (AUDIT LOG - ANLIK TEPKI)
+# ---------------------------------------------------------
+# Eskiden audit log'u elle sorgulamak gerekiyordu ve kayit gec dusuyordu.
+# on_audit_log_entry_create olayi Discord kaydi olusur olusmaz gonderir.
+@bot.event
+async def on_guild_channel_delete(channel):
+    silinen_kanallar[channel.id] = channel
+    if len(silinen_kanallar) > 100:
+        silinen_kanallar.pop(next(iter(silinen_kanallar)))
+
+
+@bot.event
+async def on_guild_role_delete(role):
+    silinen_roller[role.id] = role
+    if len(silinen_roller) > 100:
+        silinen_roller.pop(next(iter(silinen_roller)))
+
+
+async def kanal_geri_yukle(guild: discord.Guild, kanal_id: int):
+    kanal = None
+    for _ in range(10):  # olay sirasi garanti degil, kisaca bekle
+        kanal = silinen_kanallar.get(kanal_id)
+        if kanal:
+            break
+        await asyncio.sleep(0.3)
+    if not kanal:
+        return
+    try:
+        if isinstance(kanal, discord.CategoryChannel):
+            yeni = await guild.create_category(
+                kanal.name, overwrites=kanal.overwrites, reason='Anti-Nuke geri yükleme'
+            )
+        elif isinstance(kanal, discord.TextChannel):
+            yeni = await guild.create_text_channel(
+                kanal.name,
+                overwrites=kanal.overwrites,
+                category=kanal.category,
+                topic=kanal.topic,
+                nsfw=kanal.nsfw,
+                slowmode_delay=kanal.slowmode_delay,
+                reason='Anti-Nuke geri yükleme',
+            )
+        elif isinstance(kanal, discord.VoiceChannel):
+            yeni = await guild.create_voice_channel(
+                kanal.name,
+                overwrites=kanal.overwrites,
+                category=kanal.category,
+                bitrate=min(kanal.bitrate, guild.bitrate_limit),
+                user_limit=kanal.user_limit,
+                reason='Anti-Nuke geri yükleme',
+            )
+        else:
+            return
+        try:
+            await yeni.edit(position=kanal.position)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f'Kanal geri yüklenemedi: {e}')
+
+
+async def rol_geri_yukle(guild: discord.Guild, rol_id: int):
+    rol = None
+    for _ in range(10):
+        rol = silinen_roller.get(rol_id)
+        if rol:
+            break
+        await asyncio.sleep(0.3)
+    if not rol:
+        return
+    try:
+        yeni = await guild.create_role(
+            name=rol.name,
+            permissions=rol.permissions,
+            colour=rol.colour,
+            hoist=rol.hoist,
+            mentionable=rol.mentionable,
+            reason='Anti-Nuke geri yükleme',
+        )
+        try:
+            await yeni.edit(position=min(rol.position, guild.me.top_role.position - 1))
+        except Exception:
+            pass
+    except Exception as e:
+        print(f'Rol geri yüklenemedi: {e}')
+
+
+@bot.event
+async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
+    guild = entry.guild
+    if not guild or entry.user_id is None or entry.user_id == bot.user.id:
+        return
+    if not guard_aktif(guild.id):
+        return
+
+    A = discord.AuditLogAction
+    act = entry.action
+    izlenen = {
+        A.channel_delete,
+        A.channel_create,
+        A.role_delete,
+        A.role_create,
+        A.role_update,
+        A.member_role_update,
+        A.ban,
+        A.kick,
+        A.member_prune,
+        A.bot_add,
+        A.invite_create,
+    }
+    if act not in izlenen:
+        return
+
+    member = guild.get_member(entry.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(entry.user_id)
+        except Exception:
+            return
+
+    hedef_ad = getattr(entry.before, 'name', None) or str(entry.target.id if entry.target else '?')
+
+    if act == A.channel_delete:
+        if await nuke_denetle(
+            guild, member, 'Channel-Delete', kanal_silme_gecmisi, 1, 10,
+            'İzinsiz kanal silme', hedef_ad,
+        ):
+            await kanal_geri_yukle(guild, entry.target.id)
+
+    elif act == A.channel_create:
+        if await nuke_denetle(
+            guild, member, 'Channel-Create', kanal_olusturma_gecmisi, 3, 10,
+            'Hızlı/izinsiz kanal oluşturma', hedef_ad,
+        ):
+            k = guild.get_channel(entry.target.id)
+            if k:
+                try:
+                    await k.delete(reason='Anti-Nuke')
+                except Exception:
+                    pass
+
+    elif act == A.role_delete:
+        if await nuke_denetle(
+            guild, member, 'Role-Delete', rol_silme_gecmisi, 1, 10,
+            'İzinsiz rol silme', hedef_ad,
+        ):
+            await rol_geri_yukle(guild, entry.target.id)
+
+    elif act == A.role_create:
+        if await nuke_denetle(
+            guild, member, 'Role-Create', rol_olusturma_gecmisi, 3, 10,
+            'Hızlı/izinsiz rol oluşturma', hedef_ad,
+        ):
+            r = guild.get_role(entry.target.id)
+            if r:
+                try:
+                    await r.delete(reason='Anti-Nuke')
+                except Exception:
+                    pass
+
+    elif act == A.role_update:
+        onceki = getattr(entry.before, 'permissions', None)
+        sonraki = getattr(entry.after, 'permissions', None)
+        if sonraki and sonraki.administrator and not (onceki and onceki.administrator):
+            if not muaf_mi(guild, member, 'Role-Update'):
+                await ceza_uygula(
+                    guild, member, 'Role Administrator yetkisi verme',
+                    'Role-Update', hedef_ad,
+                )
+                r = guild.get_role(entry.target.id)
+                if r and onceki is not None:
+                    try:
+                        await r.edit(permissions=onceki, reason='Anti-Nuke geri alma')
+                    except Exception:
+                        pass
+
+    elif act == A.member_role_update:
+        eklenenler = [
+            guild.get_role(r.id) for r in (getattr(entry.after, 'roles', None) or [])
+        ]
+        tehlikeli = [r for r in eklenenler if r and tehlikeli_rol_mu(r)]
+        if tehlikeli and not muaf_mi(guild, member, 'Role-Add'):
+            await ceza_uygula(
+                guild, member, 'İzinsiz yetkili rol verme', 'Role-Add',
+                ', '.join(r.name for r in tehlikeli),
+            )
+            hedef = guild.get_member(entry.target.id)
+            if hedef:
+                try:
+                    await hedef.remove_roles(*tehlikeli, reason='Anti-Nuke geri alma')
+                except Exception:
+                    pass
+
+    elif act == A.ban:
+        await nuke_denetle(
+            guild, member, 'Ban', ban_gecmisi, 3, 15,
+            'Kısa sürede toplu ban', str(entry.target.id),
+        )
+
+    elif act == A.kick:
+        await nuke_denetle(
+            guild, member, 'Kick', kick_gecmisi, 3, 15,
+            'Kısa sürede toplu kick', str(entry.target.id),
+        )
+
+    elif act == A.member_prune:
+        if not muaf_mi(guild, member, 'Prune'):
+            await ceza_uygula(guild, member, 'Toplu üye çıkarma (Prune)', 'Prune')
+
+    elif act == A.bot_add:
+        if not muaf_mi(guild, member, 'Bot-Add'):
+            await ceza_uygula(guild, member, 'İzinsiz bot ekleme', 'Bot-Add', hedef_ad)
+            eklenen = guild.get_member(entry.target.id)
+            if eklenen:
+                try:
+                    await eklenen.kick(reason='Anti-Nuke: izinsiz bot')
+                except Exception:
+                    pass
+
+    elif act == A.invite_create:
+        if not muaf_mi(guild, member, 'Invite-Link'):
+            kod = getattr(entry.after, 'code', None)
+            if kod:
+                try:
+                    await bot.http.delete_invite(kod, reason='Anti-Nuke: izinsiz davet')
+                except Exception:
+                    pass
+            embed = discord.Embed(
+                title='🔗 • İzinsiz Davet Linki Silindi',
+                color=0xE67E22,
+                timestamp=simdi(),
+            )
+            embed.add_field(name='Kullanıcı:', value=member.mention)
+            embed.add_field(name='Kod:', value=f'`{kod}`')
+            await erensi_log_gonder(guild, embed)
+
+
+# ---------------------------------------------------------
+# 6. MESAJ KORUMASI (LINK / ETIKET / SPAM)
+# ---------------------------------------------------------
+async def mesaj_denetle(message: discord.Message) -> bool:
+    """Mesaj silindiyse True doner."""
+    guild = message.guild
+    member = message.author
+    if member.id in (guild.owner_id, BOT_SAHIBI_ID):
+        return False
+
+    # @everyone / @here
+    if message.mention_everyone and not is_whitelisted(guild.id, member, 'Mention'):
+        try:
+            await message.delete()
+            await member.timeout(timedelta(minutes=10), reason='İzinsiz @everyone/@here')
+        except Exception:
+            pass
+        await message.channel.send(
+            f'⚠️ {member.mention} `@everyone/@here` kullanma yetkin yok!',
+            delete_after=5,
+        )
+        return True
+
+    # Link
+    kanal_adi = message.channel.name.lower() if hasattr(message.channel, 'name') else ''
+    ticket_kanali = any(k in kanal_adi for k in TICKET_KANAL_KEYWORDS)
+    if (
+        not ticket_kanali
+        and LINK_REGEX.search(message.content)
+        and not is_whitelisted(guild.id, member, 'Link')
+    ):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.channel.send(
+            f'⚠️ {member.mention} link paylaşma yetkin yok!', delete_after=5
+        )
+        embed = discord.Embed(
+            title='🔗 • İzinsiz Link Silindi', color=0xE67E22, timestamp=simdi()
+        )
+        embed.add_field(name='Kullanıcı:', value=member.mention)
+        embed.add_field(name='Kanal:', value=message.channel.mention)
+        embed.add_field(name='İçerik:', value=f'```{message.content[:300]}```', inline=False)
+        await erensi_log_gonder(guild, embed)
+        return True
+
+    # Toplu etiket
+    if len(message.mentions) >= 5 and not is_whitelisted(guild.id, member, 'Mention'):
+        try:
+            await message.delete()
+            await member.timeout(timedelta(minutes=10), reason='Etiket spam')
+        except Exception:
+            pass
+        return True
+
+    # Mesaj spam (5 sn'de 6 mesaj)
+    if not is_whitelisted(guild.id, member, 'All'):
+        if limit_asildi(mesaj_gecmisi, (guild.id, member.id), 6, 5):
+            mesaj_gecmisi[(guild.id, member.id)] = []
+            try:
+                await member.timeout(timedelta(minutes=5), reason='Mesaj spam')
+                await message.channel.purge(
+                    limit=15, check=lambda m: m.author.id == member.id
+                )
+            except Exception:
+                pass
+            await message.channel.send(
+                f'🔇 {member.mention} spam yaptığı için 5 dk susturuldu.',
+                delete_after=5,
+            )
+            return True
+    return False
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    if isinstance(message.author, discord.Member) and guard_aktif(message.guild.id):
+        if await mesaj_denetle(message):
+            return
+    await bot.process_commands(message)
+
+
+# ---------------------------------------------------------
+# 7. GELEN / GIDEN / OTOROL / DAVET TAKIBI
+# ---------------------------------------------------------
+@bot.event
+async def on_invite_create(invite):
+    davet_hafizasi.setdefault(invite.guild.id, {})[invite.code] = invite.uses
+
+
+@bot.event
+async def on_invite_delete(invite):
+    davet_hafizasi.get(invite.guild.id, {}).pop(invite.code, None)
+
+
+async def davet_eden_bul(guild: discord.Guild):
+    try:
+        yeni = await guild.invites()
+    except Exception:
+        return None
+    eski = davet_hafizasi.get(guild.id, {})
+    bulunan = None
+    for inv in yeni:
+        if inv.uses > eski.get(inv.code, 0):
+            bulunan = inv
+            break
+    davet_hafizasi[guild.id] = {i.code: i.uses for i in yeni}
+    return bulunan
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    ayar = ayar_getir(guild.id)
+
+    if ayar.get('otorol_id'):
+        rol = guild.get_role(ayar['otorol_id'])
+        if rol and rol < guild.me.top_role:
+            try:
+                await member.add_roles(rol, reason='Otorol')
+            except Exception as e:
+                print(f'Otorol verilemedi: {e}')
+
+    davet = await davet_eden_bul(guild)
+
+    kanal = guild.get_channel(ayar['gelen_giden_kanal']) if ayar.get('gelen_giden_kanal') else None
+    embed = discord.Embed(
+        title='📥 • Sunucuya Yeni Üye Katıldı!', color=0x2ECC71, timestamp=simdi()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name='Kullanıcı:', value=f'{member.mention} (`{member.name}`)')
+    embed.add_field(name='Toplam Üye Sayısı:', value=f'`{guild.member_count}`')
+    if davet and davet.inviter:
+        embed.add_field(
+            name='Davet Eden:',
+            value=f'{davet.inviter.mention} (`{davet.uses}` davet)',
+            inline=False,
+        )
+    embed.add_field(
+        name='Hesap Açılış:', value=discord.utils.format_dt(member.created_at, 'R'), inline=False
+    )
+    embed.set_footer(text=f'Kullanıcı ID: {member.id}')
+    if kanal:
+        try:
+            await kanal.send(embed=embed)
+        except Exception:
+            pass
+    await erensi_log_gonder(guild, embed)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    guild = member.guild
+    ayar = ayar_getir(guild.id)
+    kanal = guild.get_channel(ayar['gelen_giden_kanal']) if ayar.get('gelen_giden_kanal') else None
+
+    embed = discord.Embed(
+        title='📤 • Bir Üye Sunucudan Ayrıldı!', color=0xE74C3C, timestamp=simdi()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name='Kullanıcı:', value=f'{member.mention} (`{member.name}`)')
+    embed.add_field(name='Kalan Üye Sayısı', value=f'`{guild.member_count}`')
+    embed.set_footer(text=f'Kullanıcı ID: {member.id}')
+    if kanal:
+        try:
+            await kanal.send(embed=embed)
+        except Exception:
+            pass
+    await erensi_log_gonder(guild, embed)
+
+
+# ---------------------------------------------------------
+# 8. TICKET
 # ---------------------------------------------------------
 class TicketKapatView(discord.ui.View):
 
@@ -295,29 +753,29 @@ class TicketKapatView(discord.ui.View):
         style=discord.ButtonStyle.red,
         custom_id='ticket_kapat_buton',
     )
-    async def ticket_kapat(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.send_message(
-            'Destek kanalı 5 saniye içinde siliniyor...'
-        )
-        embed = discord.Embed(
-            title='🎫 • Ticket Kapatıldı!',
-            color=0xFFA500,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(
-            name='Kanal:', value=f'`#{interaction.channel.name}`', inline=True
-        )
-        embed.add_field(
-            name='Kapatan Yetkili:',
-            value=interaction.user.mention,
-            inline=True,
-        )
+    async def ticket_kapat(self, interaction: discord.Interaction, button: discord.ui.Button):
+        kanal = interaction.channel
+        izin = kanal.permissions_for(interaction.user)
+        if not (
+            izin.manage_channels
+            or interaction.user.id == BOT_SAHIBI_ID
+            or kanal.name.endswith(interaction.user.name.lower())
+        ):
+            return await interaction.response.send_message(
+                '❌ Bu talebi kapatma yetkin yok.', ephemeral=True
+            )
+
+        await interaction.response.send_message('Destek kanalı 5 saniye içinde siliniyor...')
+        embed = discord.Embed(title='🎫 • Ticket Kapatıldı!', color=0xFFA500, timestamp=simdi())
+        embed.add_field(name='Kanal:', value=f'`#{kanal.name}`')
+        embed.add_field(name='Kapatan Yetkili:', value=interaction.user.mention)
         embed.set_footer(text=f'Kullanıcı ID: {interaction.user.id}')
         await erensi_log_gonder(interaction.guild, embed)
         await asyncio.sleep(5)
-        await interaction.channel.delete()
+        try:
+            await kanal.delete()
+        except Exception as e:
+            print(f'Ticket silinemedi: {e}')
 
 
 class TicketView(discord.ui.View):
@@ -325,9 +783,7 @@ class TicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def kanal_olustur(
-        self, interaction: discord.Interaction, kategori_adi: str
-    ):
+    async def kanal_olustur(self, interaction: discord.Interaction, kategori_adi: str):
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
@@ -338,11 +794,10 @@ class TicketView(discord.ui.View):
             user = interaction.user
             kanal_adi = f'{kategori_adi}-{user.name.lower()}'
 
-            existing_channel = discord.utils.get(guild.channels, name=kanal_adi)
-            if existing_channel:
+            mevcut = discord.utils.get(guild.text_channels, name=kanal_adi)
+            if mevcut:
                 return await interaction.followup.send(
-                    f'Zaten açık bir **{kategori_adi}** biletiniz var:'
-                    f' {existing_channel.mention}',
+                    f'Zaten açık bir **{kategori_adi}** biletiniz var: {mevcut.mention}',
                     ephemeral=True,
                 )
 
@@ -351,15 +806,11 @@ class TicketView(discord.ui.View):
 
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                user: discord.PermissionOverwrite(
-                    read_messages=True, send_messages=True
-                ),
-                guild.me: discord.PermissionOverwrite(
-                    read_messages=True, send_messages=True
-                ),
+                user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
             }
 
-            if category:
+            if isinstance(category, discord.CategoryChannel):
                 ticket_channel = await category.create_text_channel(
                     name=kanal_adi, overwrites=overwrites
                 )
@@ -369,8 +820,7 @@ class TicketView(discord.ui.View):
                 )
 
             await interaction.followup.send(
-                f'**{kategori_adi.upper()}** talebiniz oluşturuldu:'
-                f' {ticket_channel.mention}',
+                f'**{kategori_adi.upper()}** talebiniz oluşturuldu: {ticket_channel.mention}',
                 ephemeral=True,
             )
 
@@ -382,366 +832,268 @@ class TicketView(discord.ui.View):
             elif kategori_adi in ['partner', 'genel-destek', 'reklam']:
                 rol_etiketleri = '<@&1545087590460293120>'
 
-            mesaj_icerigi = (
+            mesaj = (
                 f'Merhaba {user.mention} {rol_etiketleri},'
                 f' **{kategori_adi.upper()}** talebiniz alındı. Yetkililer en kısa'
                 ' sürede sizinle ilgilenecektir.\n\n'
             )
 
             if kategori_adi == 'ekip-alim':
-                mesaj_icerigi += (
+                mesaj += (
                     '📋 **Lütfen başvuru formunu doldurun:**\n```\nİsim: \nYaş: \nTier:'
                     ' \nGünlük Aktiflik Süren: \nMobil/Pc: \nÖnceki Ulusun: \nNeden'
                     ' Ayrıldın: \nNeden Biz:\n```\n'
                 )
             elif kategori_adi == 'partner':
-                mesaj_icerigi += '📋 **Sunucunuz kaç kişi?**\n'
+                mesaj += '📋 **Sunucunuz kaç kişi?**\n'
             elif kategori_adi == 'merge-ally':
-                mesaj_icerigi += (
+                mesaj += (
                     '📋 **Günlük kaç aktif çekiyorsunuz?**\n **Hangi Sunucuları'
                     ' Oynuyorsunuz?**\n'
                 )
             elif kategori_adi == 'reklam':
-                mesaj_icerigi += '📋 **Hangi paketi alacaksınız?**\n'
+                mesaj += '📋 **Hangi paketi alacaksınız?**\n'
             elif kategori_adi == 'genel-destek':
-                mesaj_icerigi += '📋 **Sorununuz nedir?**\n'
+                mesaj += '📋 **Sorununuz nedir?**\n'
 
-            mesaj_icerigi += (
-                '\nTalebi sonlandırmak için aşağıdaki butona basabilirsiniz.'
+            mesaj += '\nTalebi sonlandırmak için aşağıdaki butona basabilirsiniz.'
+            await ticket_channel.send(
+                mesaj,
+                view=TicketKapatView(),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
             )
-            await ticket_channel.send(mesaj_icerigi, view=TicketKapatView())
 
             embed = discord.Embed(
-                title='🎫 • Yeni Bir Ticket Açıldı!',
-                color=0x2ECC71,
-                timestamp=datetime.now(timezone.utc),
+                title='🎫 • Yeni Bir Ticket Açıldı!', color=0x2ECC71, timestamp=simdi()
             )
-            embed.add_field(name='Kullanıcı:', value=user.mention, inline=True)
-            embed.add_field(
-                name='Kategori:', value=f'`{kategori_adi.upper()}`', inline=True
-            )
-            embed.add_field(name='Kanal:', value=ticket_channel.mention, inline=True)
+            embed.add_field(name='Kullanıcı:', value=user.mention)
+            embed.add_field(name='Kategori:', value=f'`{kategori_adi.upper()}`')
+            embed.add_field(name='Kanal:', value=ticket_channel.mention)
             embed.set_footer(text=f'Kullanıcı ID: {user.id}')
             await erensi_log_gonder(guild, embed)
 
         except Exception as e:
             print(f'❌ Ticket oluşturulurken hata: {e}')
+            try:
+                await interaction.followup.send(
+                    '❌ Ticket oluşturulamadı (botun kanal oluşturma yetkisini kontrol edin).',
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
 
-    @discord.ui.button(
-        label='⚔️ Ekip Alım',
-        style=discord.ButtonStyle.red,
-        custom_id='btn_ekip_alim',
-    )
-    async def ekip_alim(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    @discord.ui.button(label='⚔️ Ekip Alım', style=discord.ButtonStyle.red, custom_id='btn_ekip_alim')
+    async def ekip_alim(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.kanal_olustur(interaction, 'ekip-alim')
 
-    @discord.ui.button(
-        label='🛡️ Merge / Ally',
-        style=discord.ButtonStyle.green,
-        custom_id='btn_merge_ally',
-    )
-    async def merge_ally(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    @discord.ui.button(label='🛡️ Merge / Ally', style=discord.ButtonStyle.green, custom_id='btn_merge_ally')
+    async def merge_ally(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.kanal_olustur(interaction, 'merge-ally')
 
-    @discord.ui.button(
-        label='🤝 Partner',
-        style=discord.ButtonStyle.blurple,
-        custom_id='btn_partner',
-    )
-    async def partner(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    @discord.ui.button(label='🤝 Partner', style=discord.ButtonStyle.blurple, custom_id='btn_partner')
+    async def partner(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.kanal_olustur(interaction, 'partner')
 
-    @discord.ui.button(
-        label='💸 Reklam',
-        style=discord.ButtonStyle.blurple,
-        custom_id='btn_reklam',
-    )
-    async def reklam(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    @discord.ui.button(label='💸 Reklam', style=discord.ButtonStyle.blurple, custom_id='btn_reklam')
+    async def reklam(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.kanal_olustur(interaction, 'reklam')
 
-    @discord.ui.button(
-        label='💠 Genel Destek',
-        style=discord.ButtonStyle.secondary,
-        custom_id='btn_genel_destek',
-    )
-    async def genel_destek(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    @discord.ui.button(label='💠 Genel Destek', style=discord.ButtonStyle.secondary, custom_id='btn_genel_destek')
+    async def genel_destek(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.kanal_olustur(interaction, 'genel-destek')
 
 
 # ---------------------------------------------------------
-# 6. TAM TÜRKÇE WHITELIST SİSTEMİ
+# 9. YETKI KONTROL YARDIMCILARI
 # ---------------------------------------------------------
+def sahip_mi(interaction: discord.Interaction) -> bool:
+    return interaction.user.id in (interaction.guild.owner_id, BOT_SAHIBI_ID)
+
+
+def yetkili_mi(interaction: discord.Interaction, perm: str, kategori: str) -> bool:
+    u = interaction.user
+    return (
+        sahip_mi(interaction)
+        or getattr(u.guild_permissions, perm, False)
+        or is_whitelisted(interaction.guild.id, u, kategori)
+    )
+
+
+def hedef_kontrol(interaction: discord.Interaction, hedef: discord.Member) -> str:
+    """Sorun varsa hata mesaji, yoksa bos string doner."""
+    if hedef.id == interaction.guild.owner_id:
+        return '❌ Sunucu sahibine işlem yapılamaz.'
+    if hedef.id == bot.user.id:
+        return '❌ Bana işlem yapamazsın.'
+    if interaction.guild.me.top_role <= hedef.top_role:
+        return '❌ Bu kullanıcının rolü benden yüksek/eşit. Bot rolünü yukarı taşıyın.'
+    if not sahip_mi(interaction) and interaction.user.top_role <= hedef.top_role:
+        return '❌ Kendi rolünüzden yüksek/eşit birine işlem yapamazsınız.'
+    return ''
+
+
+def whitelist_yetki_ve_hiyerarsi_kontrolu(
+    interaction: discord.Interaction, target_role: discord.Role
+) -> tuple:
+    user = interaction.user
+    guild = interaction.guild
+
+    if not (
+        sahip_mi(interaction)
+        or user.guild_permissions.administrator
+        or is_whitelisted(guild.id, user, 'Role-Command')
+    ):
+        return (
+            False,
+            '❌ Bu komut için `/whitelist` listesinde `Rol Verme/Alma Komutu (Role-Command)` yetkin olmalı!',
+        )
+    if target_role.managed or target_role.is_default():
+        return False, '❌ Bu rol elle verilip alınamaz (bot/entegrasyon rolü veya @everyone).'
+    if guild.me.top_role <= target_role:
+        return False, '❌ Bu rol benim en yüksek rolümden üstte veya eşit! Bot rolünü yukarı taşıyın.'
+    if not sahip_mi(interaction) and user.top_role <= target_role:
+        return False, '❌ Kendi en yüksek rolünüzden yüksek veya eşit bir rolü veremez/alamazsınız!'
+    return True, ''
+
+
+# ---------------------------------------------------------
+# 10. WHITELIST KOMUTLARI
+# ---------------------------------------------------------
+WHITELIST_CHOICES = [
+    app_commands.Choice(name='Kullanıcı/Rol: Tüm Yetkiler (Tam Güven)', value='All'),
+    app_commands.Choice(name='İşlem: Bağlantı/Link Paylaşma', value='Link'),
+    app_commands.Choice(name='İşlem: Etiket Yetkisi (@everyone/@here)', value='Mention'),
+    app_commands.Choice(name='İşlem: Rol Verme/Alma Komutu (/rolver /rolal)', value='Role-Command'),
+    app_commands.Choice(name='İşlem: Üye Yasaklama (Ban)', value='Ban'),
+    app_commands.Choice(name='İşlem: Üye Atma (Kick)', value='Kick'),
+    app_commands.Choice(name='İşlem: Bot Ekleme', value='Bot-Add'),
+    app_commands.Choice(name='İşlem: Rol Güncelleme', value='Role-Update'),
+    app_commands.Choice(name='İşlem: Yetkili Rol Verme', value='Role-Add'),
+    app_commands.Choice(name='İşlem: Kanal Oluşturma', value='Channel-Create'),
+    app_commands.Choice(name='İşlem: Kanal Silme', value='Channel-Delete'),
+    app_commands.Choice(name='İşlem: Rol Oluşturma', value='Role-Create'),
+    app_commands.Choice(name='İşlem: Rol Silme', value='Role-Delete'),
+    app_commands.Choice(name='İşlem: Davet Linki Açma', value='Invite-Link'),
+    app_commands.Choice(name='İşlem: Toplu Üye Çıkarma (Prune)', value='Prune'),
+]
+
+
 class WhitelistGroup(app_commands.Group):
 
     def __init__(self):
         super().__init__(
             name='whitelist',
             description='Anti-nuke ve işlem whitelist yetki yönetimi',
+            guild_only=True,
         )
 
-    WHITELIST_CHOICES = [
-        app_commands.Choice(
-            name='Kullanıcı/Rol: Tüm Yetkiler (Tam Güven)', value='All'
-        ),
-        app_commands.Choice(name='İşlem: Bağlantı/Link Paylaşma', value='Link'),
-        app_commands.Choice(
-            name='İşlem: Etiket Yetkisi (@everyone/@here)', value='Mention'
-        ),
-        app_commands.Choice(
-            name='İşlem: Rol Verme/Alma Komutu (/rolver /rolal)',
-            value='Role-Command',
-        ),
-        app_commands.Choice(name='İşlem: Üye Yasaklama (Ban)', value='Ban'),
-        app_commands.Choice(name='İşlem: Üye Atma (Kick)', value='Kick'),
-        app_commands.Choice(name='İşlem: Bot Ekleme', value='Bot-Add'),
-        app_commands.Choice(
-            name='İşlem: Rol Güncelleme/Verme', value='Role-Update'
-        ),
-        app_commands.Choice(name='İşlem: Rol Ekleme/Verme', value='Role-Add'),
-        app_commands.Choice(
-            name='İşlem: Kanal Oluşturma', value='Channel-Create'
-        ),
-        app_commands.Choice(name='İşlem: Kanal Silme', value='Channel-Delete'),
-        app_commands.Choice(name='İşlem: Rol Oluşturma', value='Role-Create'),
-        app_commands.Choice(name='İşlem: Rol Silme', value='Role-Delete'),
-        app_commands.Choice(name='İşlem: Davet Linki Açma', value='Invite-Link'),
-        app_commands.Choice(
-            name='İşlem: Toplu Üye Çıkarma (Prune)', value='Prune'
-        ),
-    ]
-
-    @app_commands.command(
-        name='add_user',
-        description='Kullanıcıya belirli bir eylem için yetki tanımlar.',
-    )
-    @app_commands.describe(
-        user='Yetkilendirilecek üye', category='Yetki kategorisi'
-    )
+    @app_commands.command(name='add_user', description='Kullanıcıya belirli bir eylem için yetki tanımlar.')
+    @app_commands.describe(user='Yetkilendirilecek üye', category='Yetki kategorisi')
     @app_commands.choices(category=WHITELIST_CHOICES)
-    async def add_user(
-        self,
-        interaction: discord.Interaction,
-        user: discord.Member,
-        category: app_commands.Choice[str],
-    ):
-        if (
-            interaction.user.id != interaction.guild.owner_id
-            and interaction.user.id != BOT_SAHIBI_ID
-        ):
+    async def add_user(self, interaction: discord.Interaction, user: discord.Member, category: app_commands.Choice[str]):
+        if not sahip_mi(interaction):
+            return await interaction.response.send_message('❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True)
+
+        g = ayar_getir(interaction.guild_id)
+        perms = g['users'].setdefault(str(user.id), [])
+        if category.value in perms:
             return await interaction.response.send_message(
-                '❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True
+                f'⚠️ {user.mention} zaten `{category.name}` yetkisine sahip.', ephemeral=True
             )
-
-        data = load_whitelist()
-        g_id = str(interaction.guild_id)
-        u_id = str(user.id)
-
-        if g_id not in data:
-            data[g_id] = {
-                'users': {},
-                'roles': {},
-                'log_channel_id': None,
-                'gelen_giden_kanal': None,
-                'otorol_id': None,
-            }
-        if 'users' not in data[g_id]:
-            data[g_id]['users'] = {}
-        if u_id not in data[g_id]['users']:
-            data[g_id]['users'][u_id] = []
-
-        if category.value in data[g_id]['users'][u_id]:
-            return await interaction.response.send_message(
-                f'⚠️ {user.mention} zaten `{category.name}` yetkisine sahip.',
-                ephemeral=True,
-            )
-
-        data[g_id]['users'][u_id].append(category.value)
-        save_whitelist(data)
+        perms.append(category.value)
+        save_whitelist()
 
         embed = discord.Embed(
             title='🛡️ • Whitelist Güncellendi!',
-            description=(
-                f'{user.mention} kullanıcısına **`{category.name}`** izni verildi.'
-            ),
+            description=f'{user.mention} kullanıcısına **`{category.name}`** izni verildi.',
             color=0x2ECC71,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=simdi(),
         )
         embed.set_footer(text=f'Yetki Veren: {interaction.user.name}')
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(
-        name='add_role',
-        description='Bir role toplu yetki tanımlar (Örn: Link izni).',
-    )
+    @app_commands.command(name='add_role', description='Bir role toplu yetki tanımlar (Örn: Link izni).')
     @app_commands.describe(role='Yetkilendirilecek rol', category='Yetki türü')
     @app_commands.choices(category=WHITELIST_CHOICES)
-    async def add_role(
-        self,
-        interaction: discord.Interaction,
-        role: discord.Role,
-        category: app_commands.Choice[str],
-    ):
-        if (
-            interaction.user.id != interaction.guild.owner_id
-            and interaction.user.id != BOT_SAHIBI_ID
-        ):
+    async def add_role(self, interaction: discord.Interaction, role: discord.Role, category: app_commands.Choice[str]):
+        if not sahip_mi(interaction):
+            return await interaction.response.send_message('❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True)
+
+        g = ayar_getir(interaction.guild_id)
+        perms = g['roles'].setdefault(str(role.id), [])
+        if category.value in perms:
             return await interaction.response.send_message(
-                '❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True
+                f'⚠️ {role.mention} rolü zaten `{category.name}` yetkisine sahip.', ephemeral=True
             )
-
-        data = load_whitelist()
-        g_id = str(interaction.guild_id)
-        r_id = str(role.id)
-
-        if g_id not in data:
-            data[g_id] = {
-                'users': {},
-                'roles': {},
-                'log_channel_id': None,
-                'gelen_giden_kanal': None,
-                'otorol_id': None,
-            }
-        if 'roles' not in data[g_id]:
-            data[g_id]['roles'] = {}
-        if r_id not in data[g_id]['roles']:
-            data[g_id]['roles'][r_id] = []
-
-        if category.value in data[g_id]['roles'][r_id]:
-            return await interaction.response.send_message(
-                f'⚠️ {role.mention} rolü zaten `{category.name}` yetkisine sahip.',
-                ephemeral=True,
-            )
-
-        data[g_id]['roles'][r_id].append(category.value)
-        save_whitelist(data)
+        perms.append(category.value)
+        save_whitelist()
 
         embed = discord.Embed(
             title='🛡️ • Role Whitelist Yetkisi Verildi!',
-            description=(
-                f'{role.mention} rolüne sahip herkes için **`{category.name}`**'
-                ' izni aktif edildi.'
-            ),
+            description=f'{role.mention} rolüne sahip herkes için **`{category.name}`** izni aktif edildi.',
             color=0x2ECC71,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=simdi(),
         )
         embed.set_footer(text=f'Yetki Veren: {interaction.user.name}')
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(
-        name='remove_user',
-        description='Kullanıcının whitelist yetkilerini kaldırır.',
-    )
-    async def remove_user(
-        self, interaction: discord.Interaction, user: discord.Member
-    ):
-        if (
-            interaction.user.id != interaction.guild.owner_id
-            and interaction.user.id != BOT_SAHIBI_ID
-        ):
+    @app_commands.command(name='remove_user', description='Kullanıcının whitelist yetkilerini kaldırır.')
+    async def remove_user(self, interaction: discord.Interaction, user: discord.Member):
+        if not sahip_mi(interaction):
+            return await interaction.response.send_message('❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True)
+
+        g = ayar_getir(interaction.guild_id)
+        if str(user.id) in g['users']:
+            del g['users'][str(user.id)]
+            save_whitelist()
             return await interaction.response.send_message(
-                '❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True
+                f'🗑️ {user.mention} kullanıcısının tüm whitelist yetkileri kaldırıldı.'
             )
+        await interaction.response.send_message('❌ Bu kullanıcı whitelist listesinde bulunamadı.', ephemeral=True)
 
-        data = load_whitelist()
-        g_id = str(interaction.guild_id)
-        u_id = str(user.id)
+    @app_commands.command(name='remove_role', description='Bir rolün whitelist yetkilerini kaldırır.')
+    async def remove_role(self, interaction: discord.Interaction, role: discord.Role):
+        if not sahip_mi(interaction):
+            return await interaction.response.send_message('❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True)
 
-        if (
-            g_id in data
-            and 'users' in data[g_id]
-            and u_id in data[g_id]['users']
-        ):
-            del data[g_id]['users'][u_id]
-            save_whitelist(data)
-            return await interaction.response.send_message(
-                f'🗑️ {user.mention} kullanıcısının tüm whitelist yetkileri'
-                ' kaldırıldı.'
-            )
-
-        await interaction.response.send_message(
-            '❌ Bu kullanıcı whitelist listesinde bulunamadı.', ephemeral=True
-        )
-
-    @app_commands.command(
-        name='remove_role', description='Bir rolün whitelist yetkilerini kaldırır.'
-    )
-    async def remove_role(
-        self, interaction: discord.Interaction, role: discord.Role
-    ):
-        if (
-            interaction.user.id != interaction.guild.owner_id
-            and interaction.user.id != BOT_SAHIBI_ID
-        ):
-            return await interaction.response.send_message(
-                '❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True
-            )
-
-        data = load_whitelist()
-        g_id = str(interaction.guild_id)
-        r_id = str(role.id)
-
-        if (
-            g_id in data
-            and 'roles' in data[g_id]
-            and r_id in data[g_id]['roles']
-        ):
-            del data[g_id]['roles'][r_id]
-            save_whitelist(data)
+        g = ayar_getir(interaction.guild_id)
+        if str(role.id) in g['roles']:
+            del g['roles'][str(role.id)]
+            save_whitelist()
             return await interaction.response.send_message(
                 f'🗑️ {role.mention} rolünün tüm whitelist yetkileri kaldırıldı.'
             )
+        await interaction.response.send_message('❌ Bu rol whitelist listesinde bulunamadı.', ephemeral=True)
 
-        await interaction.response.send_message(
-            '❌ Bu rol whitelist listesinde bulunamadı.', ephemeral=True
-        )
-
-    @app_commands.command(
-        name='list',
-        description='Sunucudaki whitelist kullanıcı ve rollerini listeler.',
-    )
+    @app_commands.command(name='list', description='Sunucudaki whitelist kullanıcı ve rollerini listeler.')
     async def list_users(self, interaction: discord.Interaction):
-        data = load_whitelist()
-        g_id = str(interaction.guild_id)
-        users = data.get(g_id, {}).get('users', {})
-        roles = data.get(g_id, {}).get('roles', {})
+        g = ayar_getir(interaction.guild_id)
+        users, roles = g['users'], g['roles']
 
         if not users and not roles:
             return await interaction.response.send_message(
-                'ℹ️ Whitelist listesinde hiç yetkili kullanıcı veya rol yok.',
-                ephemeral=True,
+                'ℹ️ Whitelist listesinde hiç yetkili kullanıcı veya rol yok.', ephemeral=True
             )
 
         desc = '### 👤 Yetkili Kullanıcılar:\n'
         if users:
             for u_id, perms in users.items():
-                perm_str = ', '.join([f'`{p}`' for p in perms])
-                desc += f'• <@{u_id}>: {perm_str}\n'
+                desc += f'• <@{u_id}>: ' + ', '.join(f'`{p}`' for p in perms) + '\n'
         else:
             desc += '*Ekli kullanıcı yok.*\n'
 
         desc += '\n### 🛡️ Yetkili Roller:\n'
         if roles:
             for r_id, perms in roles.items():
-                perm_str = ', '.join([f'`{p}`' for p in perms])
-                desc += f'• <@&{r_id}>: {perm_str}\n'
+                desc += f'• <@&{r_id}>: ' + ', '.join(f'`{p}`' for p in perms) + '\n'
         else:
             desc += '*Ekli rol yok.*\n'
 
         embed = discord.Embed(
             title='📜 • Whitelist Yetki Listesi',
-            description=desc,
+            description=desc[:4000],
             color=0x3498DB,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=simdi(),
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -750,166 +1102,314 @@ bot.tree.add_command(WhitelistGroup())
 
 
 # ---------------------------------------------------------
-# 7. LOG KANALI VE YÖNETİM KOMUTLARI
+# 11. AYAR KOMUTLARI
 # ---------------------------------------------------------
-@bot.tree.command(
-    name='set_log_channel',
-    description='Tüm sunucu ve güvenlik loglarının gönderileceği kanalı ayarlar.',
-)
+@bot.tree.command(name='set_log_channel', description='Tüm sunucu ve güvenlik loglarının gönderileceği kanalı ayarlar.')
 @app_commands.default_permissions(administrator=True)
-async def set_log_channel(
-    interaction: discord.Interaction, channel: discord.TextChannel
-):
-    if (
-        interaction.user.id != interaction.guild.owner_id
-        and not interaction.user.guild_permissions.administrator
-    ):
-        return await interaction.response.send_message(
-            '❌ Bu ayarı sadece yöneticiler değiştirebilir.', ephemeral=True
-        )
+@app_commands.guild_only()
+async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not (sahip_mi(interaction) or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message('❌ Bu ayarı sadece yöneticiler değiştirebilir.', ephemeral=True)
 
-    data = load_whitelist()
-    g_id = str(interaction.guild_id)
-
-    if g_id not in data:
-        data[g_id] = {
-            'users': {},
-            'roles': {},
-            'log_channel_id': None,
-            'gelen_giden_kanal': None,
-            'otorol_id': None,
-        }
-
-    data[g_id]['log_channel_id'] = channel.id
-    save_whitelist(data)
-
+    ayar_getir(interaction.guild_id)['log_channel_id'] = channel.id
+    save_whitelist()
     await interaction.response.send_message(
-        f'📋 **Erensi Tarzı Sunucu Log Kanalı Ayarlandı:** {channel.mention}',
-        ephemeral=True,
+        f'📋 **Sunucu Log Kanalı Ayarlandı:** {channel.mention}', ephemeral=True
     )
 
 
-# --- YENİ EKLENEN: TOPLU DM KOMUTU (/duyuru-dm) ---
-@bot.tree.command(
-    name='duyuru-dm',
-    description='Sunucudaki tüm üyelere özel mesaj (DM) olarak duyuru iletir.',
+@bot.tree.command(name='gelen_giden_kanal', description='Giriş/çıkış mesajlarının atılacağı kanalı ayarlar.')
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def gelen_giden_kanal(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not (sahip_mi(interaction) or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message('❌ Yalnızca yöneticiler.', ephemeral=True)
+    ayar_getir(interaction.guild_id)['gelen_giden_kanal'] = channel.id
+    save_whitelist()
+    await interaction.response.send_message(f'✅ Gelen/Giden kanalı: {channel.mention}', ephemeral=True)
+
+
+@bot.tree.command(name='otorol', description='Sunucuya girenlere otomatik verilecek rolü ayarlar.')
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def otorol(interaction: discord.Interaction, role: discord.Role):
+    if not (sahip_mi(interaction) or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message('❌ Yalnızca yöneticiler.', ephemeral=True)
+    if role.managed or role >= interaction.guild.me.top_role:
+        return await interaction.response.send_message('❌ Bu rolü ben veremem (rolüm yetersiz).', ephemeral=True)
+    ayar_getir(interaction.guild_id)['otorol_id'] = role.id
+    save_whitelist()
+    await interaction.response.send_message(f'✅ Otorol: {role.mention}', ephemeral=True)
+
+
+@bot.tree.command(name='guard', description='Anti-nuke ve mesaj korumasını açar/kapatır.')
+@app_commands.describe(durum='Açık / Kapalı')
+@app_commands.choices(
+    durum=[app_commands.Choice(name='Açık', value='ac'), app_commands.Choice(name='Kapalı', value='kapat')]
 )
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def guard_komut(interaction: discord.Interaction, durum: app_commands.Choice[str]):
+    if not sahip_mi(interaction):
+        return await interaction.response.send_message('❌ Yalnızca Sunucu Sahibi.', ephemeral=True)
+    ayar_getir(interaction.guild_id)['guard'] = durum.value == 'ac'
+    save_whitelist()
+    await interaction.response.send_message(f'🛡️ Guard artık **{durum.name}**.', ephemeral=True)
+
+
+@bot.tree.command(name='ticket_kur', description='Bu kanala ticket panelini gönderir.')
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def ticket_kur(interaction: discord.Interaction):
+    if not (sahip_mi(interaction) or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message('❌ Yalnızca yöneticiler.', ephemeral=True)
+    embed = discord.Embed(
+        title='🎫 • Destek Merkezi',
+        description='Aşağıdaki butonlardan ilgili kategoriyi seçerek talep oluşturabilirsiniz.',
+        color=0x3498DB,
+    )
+    await interaction.channel.send(embed=embed, view=TicketView())
+    await interaction.response.send_message('✅ Panel gönderildi.', ephemeral=True)
+
+
+# ---------------------------------------------------------
+# 12. ROL VER / ROL AL
+# ---------------------------------------------------------
+@bot.tree.command(name='rolver', description='Bir üyeye rol verir.')
+@app_commands.describe(uye='Rol verilecek üye', rol='Verilecek rol')
+@app_commands.guild_only()
+async def rolver(interaction: discord.Interaction, uye: discord.Member, rol: discord.Role):
+    ok, msg = whitelist_yetki_ve_hiyerarsi_kontrolu(interaction, rol)
+    if not ok:
+        return await interaction.response.send_message(msg, ephemeral=True)
+    if rol in uye.roles:
+        return await interaction.response.send_message('⚠️ Üyede bu rol zaten var.', ephemeral=True)
+    await uye.add_roles(rol, reason=f'/rolver - {interaction.user}')
+    await interaction.response.send_message(f'✅ {uye.mention} kullanıcısına {rol.mention} verildi.')
+
+    embed = discord.Embed(title='🎭 • Rol Verildi', color=0x2ECC71, timestamp=simdi())
+    embed.add_field(name='Yetkili:', value=interaction.user.mention)
+    embed.add_field(name='Üye:', value=uye.mention)
+    embed.add_field(name='Rol:', value=rol.mention)
+    await erensi_log_gonder(interaction.guild, embed)
+
+
+@bot.tree.command(name='rolal', description='Bir üyeden rol alır.')
+@app_commands.describe(uye='Rolü alınacak üye', rol='Alınacak rol')
+@app_commands.guild_only()
+async def rolal(interaction: discord.Interaction, uye: discord.Member, rol: discord.Role):
+    ok, msg = whitelist_yetki_ve_hiyerarsi_kontrolu(interaction, rol)
+    if not ok:
+        return await interaction.response.send_message(msg, ephemeral=True)
+    if rol not in uye.roles:
+        return await interaction.response.send_message('⚠️ Üyede bu rol yok.', ephemeral=True)
+    await uye.remove_roles(rol, reason=f'/rolal - {interaction.user}')
+    await interaction.response.send_message(f'✅ {uye.mention} kullanıcısından {rol.mention} alındı.')
+
+    embed = discord.Embed(title='🎭 • Rol Alındı', color=0xE67E22, timestamp=simdi())
+    embed.add_field(name='Yetkili:', value=interaction.user.mention)
+    embed.add_field(name='Üye:', value=uye.mention)
+    embed.add_field(name='Rol:', value=rol.mention)
+    await erensi_log_gonder(interaction.guild, embed)
+
+
+# ---------------------------------------------------------
+# 13. MODERASYON KOMUTLARI
+# ---------------------------------------------------------
+async def mod_log(interaction, baslik, renk, hedef, sebep, ekstra=None):
+    embed = discord.Embed(title=baslik, color=renk, timestamp=simdi())
+    embed.add_field(name='Yetkili:', value=interaction.user.mention)
+    embed.add_field(name='Hedef:', value=f'{hedef} (`{getattr(hedef, "id", "")}`)')
+    if ekstra:
+        embed.add_field(name='Süre:', value=ekstra)
+    embed.add_field(name='Sebep:', value=sebep, inline=False)
+    await erensi_log_gonder(interaction.guild, embed)
+
+
+@bot.tree.command(name='ban', description='Kullanıcıyı yasaklar.')
+@app_commands.describe(uye='Yasaklanacak üye', sebep='Sebep')
+@app_commands.default_permissions(ban_members=True)
+@app_commands.guild_only()
+async def ban_komut(interaction: discord.Interaction, uye: discord.Member, sebep: str = 'Sebep belirtilmedi'):
+    if not yetkili_mi(interaction, 'ban_members', 'Ban'):
+        return await interaction.response.send_message('❌ Yetkin yok.', ephemeral=True)
+    hata = hedef_kontrol(interaction, uye)
+    if hata:
+        return await interaction.response.send_message(hata, ephemeral=True)
+    try:
+        await uye.ban(reason=f'{interaction.user}: {sebep}', delete_message_seconds=0)
+    except Exception as e:
+        return await interaction.response.send_message(f'❌ Banlanamadı: `{e}`', ephemeral=True)
+    await interaction.response.send_message(f'🔨 **{uye}** yasaklandı. Sebep: {sebep}')
+    await mod_log(interaction, '🔨 • Üye Yasaklandı', 0xE74C3C, uye, sebep)
+
+
+@bot.tree.command(name='unban', description='Kullanıcının yasağını kaldırır (ID ile).')
+@app_commands.describe(kullanici_id='Yasağı kaldırılacak kullanıcı ID')
+@app_commands.default_permissions(ban_members=True)
+@app_commands.guild_only()
+async def unban_komut(interaction: discord.Interaction, kullanici_id: str):
+    if not yetkili_mi(interaction, 'ban_members', 'Ban'):
+        return await interaction.response.send_message('❌ Yetkin yok.', ephemeral=True)
+    try:
+        await interaction.guild.unban(discord.Object(id=int(kullanici_id)), reason=str(interaction.user))
+    except Exception as e:
+        return await interaction.response.send_message(f'❌ Yasak kaldırılamadı: `{e}`', ephemeral=True)
+    await interaction.response.send_message(f'✅ `{kullanici_id}` yasağı kaldırıldı.')
+    await mod_log(interaction, '♻️ • Yasak Kaldırıldı', 0x2ECC71, f'`{kullanici_id}`', '-')
+
+
+@bot.tree.command(name='kick', description='Kullanıcıyı sunucudan atar.')
+@app_commands.describe(uye='Atılacak üye', sebep='Sebep')
+@app_commands.default_permissions(kick_members=True)
+@app_commands.guild_only()
+async def kick_komut(interaction: discord.Interaction, uye: discord.Member, sebep: str = 'Sebep belirtilmedi'):
+    if not yetkili_mi(interaction, 'kick_members', 'Kick'):
+        return await interaction.response.send_message('❌ Yetkin yok.', ephemeral=True)
+    hata = hedef_kontrol(interaction, uye)
+    if hata:
+        return await interaction.response.send_message(hata, ephemeral=True)
+    try:
+        await uye.kick(reason=f'{interaction.user}: {sebep}')
+    except Exception as e:
+        return await interaction.response.send_message(f'❌ Atılamadı: `{e}`', ephemeral=True)
+    await interaction.response.send_message(f'👢 **{uye}** atıldı. Sebep: {sebep}')
+    await mod_log(interaction, '👢 • Üye Atıldı', 0xE67E22, uye, sebep)
+
+
+@bot.tree.command(name='timeout', description='Üyeyi susturur. Süre örn: 10m, 2h, 1d')
+@app_commands.describe(uye='Susturulacak üye', sure='10s / 10m / 2h / 1d', sebep='Sebep')
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.guild_only()
+async def timeout_komut(interaction: discord.Interaction, uye: discord.Member, sure: str, sebep: str = 'Sebep belirtilmedi'):
+    if not yetkili_mi(interaction, 'moderate_members', 'Kick'):
+        return await interaction.response.send_message('❌ Yetkin yok.', ephemeral=True)
+    saniye = zaman_donustur(sure)
+    if not saniye or saniye > 28 * 86400:
+        return await interaction.response.send_message('❌ Geçersiz süre. Örn: `10m`, `2h`, `1d` (en fazla 28d).', ephemeral=True)
+    hata = hedef_kontrol(interaction, uye)
+    if hata:
+        return await interaction.response.send_message(hata, ephemeral=True)
+    try:
+        await uye.timeout(timedelta(seconds=saniye), reason=f'{interaction.user}: {sebep}')
+    except Exception as e:
+        return await interaction.response.send_message(f'❌ Susturulamadı: `{e}`', ephemeral=True)
+    await interaction.response.send_message(f'🔇 **{uye}** {sure} susturuldu. Sebep: {sebep}')
+    await mod_log(interaction, '🔇 • Üye Susturuldu', 0xF1C40F, uye, sebep, sure)
+
+
+@bot.tree.command(name='temizle', description='Kanaldaki mesajları siler.')
+@app_commands.describe(adet='Silinecek mesaj sayısı (1-100)')
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.guild_only()
+async def temizle(interaction: discord.Interaction, adet: app_commands.Range[int, 1, 100]):
+    if not interaction.user.guild_permissions.manage_messages and not sahip_mi(interaction):
+        return await interaction.response.send_message('❌ Yetkin yok.', ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    silinen = await interaction.channel.purge(limit=adet)
+    await interaction.followup.send(f'🧹 `{len(silinen)}` mesaj silindi.', ephemeral=True)
+
+
+# ---------------------------------------------------------
+# 14. TOPLU DM
+# ---------------------------------------------------------
+@bot.tree.command(name='duyuru-dm', description='Sunucudaki tüm üyelere özel mesaj (DM) olarak duyuru iletir.')
 @app_commands.describe(mesaj='Gönderilecek duyuru metni')
 @app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
 async def duyuru_dm(interaction: discord.Interaction, mesaj: str):
-    if (
-        interaction.user.id != interaction.guild.owner_id
-        and interaction.user.id != BOT_SAHIBI_ID
-    ):
-        return await interaction.response.send_message(
-            '❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True
-        )
+    if not sahip_mi(interaction):
+        return await interaction.response.send_message('❌ Bu komutu yalnızca Sunucu Sahibi kullanabilir.', ephemeral=True)
 
-    await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send(
-        '🚀 **Toplu DM Gönderimi Başlatıldı!**\nÜye sayısına göre işlem biraz'
-        ' sürebilir, tamamlandığında bilgi verilecektir.',
+    await interaction.response.send_message(
+        '🚀 **Toplu DM Gönderimi Başlatıldı!** Tamamlanınca log kanalına bilgi düşecek.',
         ephemeral=True,
     )
 
+    guild = interaction.guild
+    gonderen = interaction.user
     basarili = 0
     basarisiz = 0
 
-    for member in interaction.guild.members:
+    for member in list(guild.members):
         if member.bot:
             continue
         try:
             embed = discord.Embed(
-                title=f'📢 • {interaction.guild.name} Duyurusu',
+                title=f'📢 • {guild.name} Duyurusu',
                 description=mesaj,
                 color=0x3498DB,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=simdi(),
             )
-            embed.set_footer(
-                text=f'Gönderen Yetkili: {interaction.user.name}'
-            )
+            embed.set_footer(text=f'Gönderen Yetkili: {gonderen.name}')
             await member.send(embed=embed)
             basarili += 1
-            await asyncio.sleep(1.5)  # Discord Rate-Limit koruması
         except Exception:
             basarisiz += 1
+        await asyncio.sleep(1.5)
 
     log_embed = discord.Embed(
-        title='📬 • Toplu DM Gönderimi Tamamlandı!',
-        color=0x2ECC71,
-        timestamp=datetime.now(timezone.utc),
+        title='📬 • Toplu DM Gönderimi Tamamlandı!', color=0x2ECC71, timestamp=simdi()
     )
-    log_embed.add_field(
-        name='Gönderen:', value=interaction.user.mention, inline=True
-    )
-    log_embed.add_field(name='Başarılı:', value=f'`{basarili}`', inline=True)
-    log_embed.add_field(
-        name='Başarısız (DM Kapalı):', value=f'`{basarisiz}`', inline=True
-    )
-    log_embed.add_field(
-        name='Duyuru İçeriği:', value=f'```{mesaj[:500]}```', inline=False
-    )
-    await erensi_log_gonder(interaction.guild, log_embed)
+    log_embed.add_field(name='Gönderen:', value=gonderen.mention)
+    log_embed.add_field(name='Başarılı:', value=f'`{basarili}`')
+    log_embed.add_field(name='Başarısız (DM Kapalı):', value=f'`{basarisiz}`')
+    log_embed.add_field(name='Duyuru İçeriği:', value=f'```{mesaj[:500]}```', inline=False)
+    await erensi_log_gonder(guild, log_embed)
 
 
 # ---------------------------------------------------------
-# 8. YEDEKLEME VE GERİ YÜKLEME SİSTEMİ (XENON TARZI)
+# 15. YEDEKLEME VE GERI YUKLEME
 # ---------------------------------------------------------
+def serialize_overwrites(overwrites):
+    sonuc = []
+    for target, ow in overwrites.items():
+        if not isinstance(target, discord.Role):
+            continue  # sadece rol izinleri yedeklenir
+        allow, deny = ow.pair()
+        sonuc.append({'name': target.name, 'is_role': True, 'allow': allow.value, 'deny': deny.value})
+    return sonuc
+
+
+def overwrites_olustur(guild: discord.Guild, liste):
+    ow = {}
+    for o in liste:
+        rol = discord.utils.get(guild.roles, name=o['name'])
+        if rol:
+            ow[rol] = discord.PermissionOverwrite.from_pair(
+                discord.Permissions(o['allow']), discord.Permissions(o['deny'])
+            )
+    return ow
+
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def yedek_al(ctx):
     guild = ctx.guild
-    status_msg = await ctx.send(
-        '⏳ Sunucu yapısı, roller ve kanal izinleri yedekleniyor...'
-    )
+    status_msg = await ctx.send('⏳ Sunucu yapısı, roller ve kanal izinleri yedekleniyor...')
 
-    backup_data = {
-        'roles': [],
-        'categories': [],
-        'text_channels': [],
-        'voice_channels': [],
-    }
+    backup = {'roles': [], 'categories': [], 'text_channels': [], 'voice_channels': []}
 
     for role in reversed(guild.roles):
-        if role.is_default():
-            backup_data['roles'].append({
+        if role.is_default() or not role.managed:
+            backup['roles'].append({
                 'name': role.name,
                 'permissions': role.permissions.value,
                 'color': role.color.value,
                 'hoist': role.hoist,
                 'mentionable': role.mentionable,
-                'is_default': True,
+                'is_default': role.is_default(),
             })
-        elif not role.managed:
-            backup_data['roles'].append({
-                'name': role.name,
-                'permissions': role.permissions.value,
-                'color': role.color.value,
-                'hoist': role.hoist,
-                'mentionable': role.mentionable,
-                'is_default': False,
-            })
-
-    def serialize_overwrites(overwrites):
-        serialized = []
-        for target, overwrite in overwrites.items():
-            serialized.append({
-                'name': target.name,
-                'is_role': isinstance(target, discord.Role),
-                'allow': overwrite.pair()[0].value,
-                'deny': overwrite.pair()[1].value,
-            })
-        return serialized
 
     for cat in guild.categories:
-        backup_data['categories'].append({
+        backup['categories'].append({
             'name': cat.name,
             'position': cat.position,
             'overwrites': serialize_overwrites(cat.overwrites),
         })
 
     for tc in guild.text_channels:
-        backup_data['text_channels'].append({
+        backup['text_channels'].append({
             'name': tc.name,
             'topic': tc.topic,
             'nsfw': tc.nsfw,
@@ -919,7 +1419,7 @@ async def yedek_al(ctx):
         })
 
     for vc in guild.voice_channels:
-        backup_data['voice_channels'].append({
+        backup['voice_channels'].append({
             'name': vc.name,
             'user_limit': vc.user_limit,
             'bitrate': vc.bitrate,
@@ -930,21 +1430,16 @@ async def yedek_al(ctx):
 
     file_path = f'backup_{guild.id}.json'
     with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(backup_data, f, ensure_ascii=False, indent=4)
+        json.dump(backup, f, ensure_ascii=False, indent=4)
 
     try:
         await ctx.author.send(
-            '🛡️ **Sunucu Yedeğiniz Alındı!**\nDosyayı güvenli bir yerde'
-            ' saklayabilirsiniz:',
+            '🛡️ **Sunucu Yedeğiniz Alındı!**\nDosyayı güvenli bir yerde saklayabilirsiniz:',
             file=discord.File(file_path),
         )
-        await status_msg.edit(
-            content='✅ Yedek başarıyla alındı ve özel mesajınıza (DM) gönderildi!'
-        )
+        await status_msg.edit(content='✅ Yedek başarıyla alındı ve özel mesajınıza (DM) gönderildi!')
     except discord.Forbidden:
-        await status_msg.edit(
-            content='✅ Yedek oluşturuldu fakat DM kutunuz kapalı olduğu için iletilemedi.'
-        )
+        await status_msg.edit(content='✅ Yedek oluşturuldu fakat DM kutunuz kapalı olduğu için iletilemedi.')
 
 
 @bot.command()
@@ -954,1281 +1449,165 @@ async def yedek_yukle(ctx):
     file_path = f'backup_{guild.id}.json'
 
     if not os.path.exists(file_path):
-        return await ctx.send(
-            '❌ Bu sunucuya ait yerel bir yedek dosyası (`backup.json`)'
-            ' bulunamadı!'
-        )
+        return await ctx.send(f'❌ Bu sunucuya ait yedek dosyası (`{file_path}`) bulunamadı!')
 
     confirm_msg = await ctx.send(
-        '⚠️ **DİKKAT:** Mevcut kanallar silinip roller yedeğe göre'
-        ' yapılandırılacaktır. Devam etmek için 30 saniye içinde `onayla` yazın.'
+        '⚠️ **DİKKAT:** Yedekteki **eksik** roller, kategoriler ve kanallar yeniden'
+        ' oluşturulacak (mevcut olanlara dokunulmaz). Devam etmek için 30 saniye'
+        ' içinde `onayla` yazın.'
     )
 
     def check(m):
-        return (
-            m.author == ctx.author
-            and m.channel == ctx.channel
-            and m.content.lower() == 'onayla'
-        )
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() == 'onayla'
 
     try:
         await bot.wait_for('message', timeout=30.0, check=check)
     except asyncio.TimeoutError:
-        return await confirm_msg.edit(
-            content='❌ Süre dolduğu için yedek yükleme iptal edildi.'
-        )
+        return await confirm_msg.edit(content='❌ Süre dolduğu için yedek yükleme iptal edildi.')
 
     await ctx.send('🚀 Geri yükleme başlatıldı...')
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
 
-    for ch in guild.channels:
-        try:
-            await ch.delete()
-            await asyncio.sleep(0.4)
-        except Exception:
-            pass
-
-    created_roles = {}
-    for r_data in data['roles']:
-        if r_data.get('is_default'):
-            everyone_role = guild.default_role
-            await everyone_role.edit(
-                permissions=discord.Permissions(r_data['permissions'])
-            )
-            created_roles['@everyone'] = everyone_role
-        else:
+        for r in data.get('roles', []):
+            if r.get('is_default') or discord.utils.get(guild.roles, name=r['name']):
+                continue
             try:
-                new_role = await guild.create_role(
-                    name=r_data['name'],
-                    permissions=discord.Permissions(r_data['permissions']),
-                    color=discord.Color(r_data['color']),
-                    hoist=r_data['hoist'],
-                    mentionable=r_data['mentionable'],
+                await guild.create_role(
+                    name=r['name'],
+                    permissions=discord.Permissions(r['permissions']),
+                    color=discord.Color(r['color']),
+                    hoist=r['hoist'],
+                    mentionable=r['mentionable'],
                 )
-                created_roles[new_role.name] = new_role
-                await asyncio.sleep(0.4)
             except Exception:
                 pass
 
-    def deserialize_overwrites(serialized_list):
-        overwrites = {}
-        for item in serialized_list:
-            target = created_roles.get(item['name'])
-            if target:
-                overwrites[target] = discord.PermissionOverwrite.from_pair(
-                    discord.Permissions(item['allow']),
-                    discord.Permissions(item['deny']),
-                )
-        return overwrites
-
-    created_categories = {}
-    for cat_data in data['categories']:
-        try:
-            cat = await guild.create_category(
-                name=cat_data['name'],
-                position=cat_data['position'],
-                overwrites=deserialize_overwrites(cat_data['overwrites']),
-            )
-            created_categories[cat.name] = cat
-            await asyncio.sleep(0.4)
-        except Exception:
-            pass
-
-    for tc_data in data['text_channels']:
-        try:
-            cat = created_categories.get(tc_data['category'])
-            await guild.create_text_channel(
-                name=tc_data['name'],
-                topic=tc_data['topic'],
-                nsfw=tc_data['nsfw'],
-                position=tc_data['position'],
-                category=cat,
-                overwrites=deserialize_overwrites(tc_data['overwrites']),
-            )
-            await asyncio.sleep(0.4)
-        except Exception:
-            pass
-
-    for vc_data in data['voice_channels']:
-        try:
-            cat = created_categories.get(vc_data['category'])
-            await guild.create_voice_channel(
-                name=vc_data['name'],
-                user_limit=vc_data['user_limit'],
-                bitrate=vc_data['bitrate'],
-                position=vc_data['position'],
-                category=cat,
-                overwrites=deserialize_overwrites(vc_data['overwrites']),
-            )
-            await asyncio.sleep(0.4)
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------
-# 9. AYAR VE YARDIMCI KOMUTLAR (OTOROL DAHİL)
-# ---------------------------------------------------------
-ayarla_grubu = app_commands.Group(
-    name='ayarla', description='Bot sistem ayarlarını yönetir.'
-)
-
-
-@ayarla_grubu.command(
-    name='gelengiden', description='Gelen-Giden kanalını belirler.'
-)
-@app_commands.default_permissions(administrator=True)
-async def ayarla_gelengiden(
-    interaction: discord.Interaction, kanal: discord.TextChannel
-):
-    data = load_whitelist()
-    g_id = str(interaction.guild_id)
-    if g_id not in data:
-        data[g_id] = {
-            'users': {},
-            'roles': {},
-            'log_channel_id': None,
-            'gelen_giden_kanal': None,
-            'otorol_id': None,
-        }
-
-    data[g_id]['gelen_giden_kanal'] = kanal.id
-    save_whitelist(data)
-    await interaction.response.send_message(
-        f'✅ Gelen-Giden kanalı {kanal.mention} olarak ayarlandı!', ephemeral=True
-    )
-
-
-@ayarla_grubu.command(
-    name='otorol',
-    description='Sunucuya yeni girenlere otomatik verilecek rolü ayarlar.',
-)
-@app_commands.describe(rol='Otomatik verilecek rol')
-@app_commands.default_permissions(administrator=True)
-async def ayarla_otorol(interaction: discord.Interaction, rol: discord.Role):
-    if interaction.guild.me.top_role <= rol:
-        return await interaction.response.send_message(
-            '❌ Bu rol benim en yüksek rolümden üstte veya eşit olduğu için otomatik'
-            ' veremem! Bot rolünü yukarı taşıyın.',
-            ephemeral=True,
-        )
-
-    data = load_whitelist()
-    g_id = str(interaction.guild_id)
-    if g_id not in data:
-        data[g_id] = {
-            'users': {},
-            'roles': {},
-            'log_channel_id': None,
-            'gelen_giden_kanal': None,
-            'otorol_id': None,
-        }
-
-    data[g_id]['otorol_id'] = rol.id
-    save_whitelist(data)
-    await interaction.response.send_message(
-        f'✅ **Otorol Ayarlandı:** Sunucuya yeni katılanlara otomatik olarak'
-        f' {rol.mention} rolü verilecek!',
-        ephemeral=True,
-    )
-
-
-bot.tree.add_command(ayarla_grubu)
-
-
-@bot.tree.command(
-    name='rolver',
-    description='Bir kullanıcıya rol verir (Sadece Whitelist/Yetkililer).',
-)
-@app_commands.default_permissions(send_messages=True)
-async def rol_ver_komut(
-    interaction: discord.Interaction, member: discord.Member, role: discord.Role
-):
-    await interaction.response.defer(ephemeral=True)
-    izin_var, hata_mesaji = whitelist_yetki_ve_hiyerarsi_kontrolu(
-        interaction, role
-    )
-    if not izin_var:
-        return await interaction.followup.send(hata_mesaji, ephemeral=True)
-
-    try:
-        await member.add_roles(
-            role, reason=f'Yetkili Komutu: {interaction.user.name}'
-        )
-        await interaction.followup.send(
-            f'✅ **{member.mention}** kullanıcısına **{role.name}** rolü verildi!',
-            ephemeral=True,
-        )
-    except Exception as e:
-        await interaction.followup.send(f'❌ Hata: {e}', ephemeral=True)
-
-
-@bot.tree.command(
-    name='rolal',
-    description='Bir kullanıcıdan rol alır (Sadece Whitelist/Yetkililer).',
-)
-@app_commands.default_permissions(send_messages=True)
-async def rol_al_komut(
-    interaction: discord.Interaction, member: discord.Member, role: discord.Role
-):
-    await interaction.response.defer(ephemeral=True)
-    if role not in member.roles:
-        return await interaction.followup.send(
-            f'⚠️ **{member.mention}** kullanıcısında zaten **{role.name}** rolü'
-            ' yok!',
-            ephemeral=True,
-        )
-
-    izin_var, hata_mesaji = whitelist_yetki_ve_hiyerarsi_kontrolu(
-        interaction, role
-    )
-    if not izin_var:
-        return await interaction.followup.send(hata_mesaji, ephemeral=True)
-
-    try:
-        await member.remove_roles(
-            role, reason=f'Yetkili Komutu: {interaction.user.name}'
-        )
-        await interaction.followup.send(
-            f'🗑️ **{member.mention}** kullanıcısından **{role.name}** rolü alındı!',
-            ephemeral=True,
-        )
-    except Exception as e:
-        await interaction.followup.send(f'❌ Hata: {e}', ephemeral=True)
-
-
-@bot.tree.command(name='cekilis', description='Yeni bir çekiliş başlatır.')
-@app_commands.describe(
-    sure='Örn: 30s, 10m, 2h, 1d',
-    kazanan_sayisi='Kaç kişi kazanacak?',
-    odul='Çekiliş ödülü',
-)
-@app_commands.default_permissions(manage_events=True)
-async def cekilis_baslat(
-    interaction: discord.Interaction, sure: str, kazanan_sayisi: int, odul: str
-):
-    saniye = zaman_donustur(sure)
-    if not saniye:
-        return await interaction.response.send_message(
-            '❌ Geçersiz süre! Örnek: `10m`, `1h`, `30s`.', ephemeral=True
-        )
-
-    embed = discord.Embed(
-        title=f'🎉 ÇEKİLİŞ: {odul}',
-        description=(
-            f'Katılmak için aşağıdaki 🎉 tepkisine tıklayın!\n\n⏱️ **Süre:**'
-            f' {sure}\n👑 **Kazanan Sayısı:** {kazanan_sayisi}\n📝'
-            f' **Düzenleyen:** {interaction.user.mention}'
-        ),
-        color=discord.Color.gold(),
-    )
-    embed.timestamp = datetime.now(timezone.utc) + timedelta(seconds=saniye)
-    embed.set_footer(text='Bitiş Zamanı')
-
-    await interaction.response.send_message(
-        '🎉 Çekiliş başlatıldı!', ephemeral=True
-    )
-    mesaj = await interaction.channel.send(embed=embed)
-    await mesaj.add_reaction('🎉')
-
-    await asyncio.sleep(saniye)
-
-    yeni_mesaj = await interaction.channel.fetch_message(mesaj.id)
-    reaction = discord.utils.get(yeni_mesaj.reactions, emoji='🎉')
-    users = [user async for user in reaction.users() if not user.bot]
-
-    if len(users) < kazanan_sayisi:
-        return await interaction.channel.send(
-            f'⚠️ **{odul}** çekilişi iptal edildi. Yeterli katılım olmadı.'
-        )
-
-    kazananlar = random.sample(users, kazanan_sayisi)
-    kazanan_mentions = ', '.join([k.mention for k in kazananlar])
-
-    kazanan_embed = discord.Embed(
-        title='🎉 ÇEKİLİŞ SONUÇLANDI! 🎉',
-        description=f'**Ödül:** {odul}\n**Kazanan(lar):** {kazanan_mentions}',
-        color=discord.Color.green(),
-    )
-    await interaction.channel.send(
-        content=f'Tebrikler {kazanan_mentions}!', embed=kazanan_embed
-    )
-
-
-@bot.tree.command(name='ping', description='Botun gecikme süresini gösterir.')
-async def ping(interaction: discord.Interaction):
-    bot_ping = round(bot.latency * 1000)
-    embed = discord.Embed(
-        title='🏓 Pong!',
-        description=f'**Bot Gecikmesi:** `{bot_ping} ms`',
-        color=discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(
-    name='ticket-kur', description='Destek panelini bu kanala kurar.'
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def ticket_kur(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title='🎫 Destek & İletişim Paneli',
-        description='Aşağıdaki butonlardan talep oluşturabilirsiniz.',
-        color=discord.Color.blue(),
-    )
-    await interaction.channel.send(embed=embed, view=TicketView())
-    await interaction.response.send_message(
-        'Destek paneli kuruldu!', ephemeral=True
-    )
-
-
-@bot.tree.command(
-    name='temizle', description='Belirtilen miktarda mesajı siler.'
-)
-@app_commands.checks.has_permissions(manage_messages=True)
-async def temizle(interaction: discord.Interaction, miktar: int):
-    if miktar < 1 or miktar > 100:
-        return await interaction.response.send_message(
-            '1 ile 100 arası bir sayı girin.', ephemeral=True
-        )
-
-    await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=miktar)
-    await interaction.followup.send(
-        f'🧹 {len(deleted)} mesaj temizlendi.', ephemeral=True
-    )
-
-
-@bot.tree.command(
-    name='guvenlik', description='Sunucu koruma sistemini açar/kapatır.'
-)
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.choices(
-    durum=[
-        app_commands.Choice(name='Aç 🟢', value='ac'),
-        app_commands.Choice(name='Kapat 🔴', value='kapat'),
-    ]
-)
-async def guvenlik_komut(
-    interaction: discord.Interaction, durum: app_commands.Choice[str]
-):
-    global guvenlik_aktif
-    guvenlik_aktif = durum.value == 'ac'
-    await interaction.response.send_message(
-        '🛡️ Güvenlik sistemi'
-        f" **{'AKTİF' if guvenlik_aktif else 'DEVRE DIŞI'}**.",
-        ephemeral=True,
-    )
-
-
-# ---------------------------------------------------------
-# 10. ERENSİBOT BİREBİR ŞABLONLU SUNUCU LOGLARI
-# ---------------------------------------------------------
-
-# 1. Mesaj Silinme Logu
-@bot.event
-async def on_message_delete(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-
-    embed = discord.Embed(
-        title='🗑️ • Bir Mesaj Silindi!',
-        color=0xFF4D4D,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_author(
-        name=f'{message.author} ({message.author.id})',
-        icon_url=message.author.display_avatar.url,
-    )
-    embed.add_field(
-        name='Kanal:',
-        value=f'{message.channel.mention} (`#{message.channel.name}`)',
-        inline=True,
-    )
-    embed.add_field(name='Mesaj Sahibi:', value=message.author.mention, inline=True)
-    embed.add_field(
-        name='Silinen Mesaj:',
-        value=f"```{message.content[:1000] or 'İçerik yok (Resim/Embed)'}```",
-        inline=False,
-    )
-    embed.set_footer(
-        text=f'Kullanıcı ID: {message.author.id} • Mesaj ID: {message.id}'
-    )
-    await erensi_log_gonder(message.guild, embed)
-
-
-# 2. Mesaj Düzenlenme Logu
-@bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-    if before.author.bot or not before.guild or before.content == after.content:
-        return
-
-    embed = discord.Embed(
-        title='✏️ • Bir Mesaj Düzenlendi!',
-        color=0xFFA500,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_author(
-        name=f'{before.author} ({before.author.id})',
-        icon_url=before.author.display_avatar.url,
-    )
-    embed.add_field(
-        name='Kanal:',
-        value=f'{before.channel.mention} [Mesaja Git]({after.jump_url})',
-        inline=False,
-    )
-    embed.add_field(
-        name='Eski Mesaj:',
-        value=f"```{before.content[:500] or 'Boş'}```",
-        inline=False,
-    )
-    embed.add_field(
-        name='Yeni Mesaj:',
-        value=f"```{after.content[:500] or 'Boş'}```",
-        inline=False,
-    )
-    embed.set_footer(
-        text=f'Kullanıcı ID: {before.author.id} • Mesaj ID: {after.id}'
-    )
-    await erensi_log_gonder(before.guild, embed)
-
-
-# 3. Kanal Oluşturma Logu & Guard
-@bot.event
-async def on_guild_channel_create(channel):
-    guild = channel.guild
-    simdi = datetime.now(timezone.utc).timestamp()
-    await asyncio.sleep(0.3)
-
-    yapan_kisi = 'Bilinmiyor'
-    olusturan_user = None
-
-    try:
-        async for entry in guild.audit_logs(
-            action=discord.AuditLogAction.channel_create, limit=1
-        ):
-            if (
-                datetime.now(timezone.utc) - entry.created_at
-            ).total_seconds() < 5.0 and entry.target.id == channel.id:
-                olusturan_user = entry.user
-                yapan_kisi = (
-                    f'{entry.user.mention} (`{entry.user.name}` - `{entry.user.id}`)'
-                )
-                break
-    except Exception as e:
-        print(f'Audit log hatası (Kanal Oluşturma): {e}')
-
-    embed = discord.Embed(
-        title='📁 • Yeni Bir Kanal Oluşturuldu!',
-        color=0x2ECC71,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(
-        name='Kanal Adı:',
-        value=f'`#{channel.name}` ({channel.mention})',
-        inline=True,
-    )
-    embed.add_field(
-        name='Kanal Türü:',
-        value=f'`{str(channel.type).capitalize()}`',
-        inline=True,
-    )
-    embed.add_field(name='Oluşturan Yetkili:', value=yapan_kisi, inline=False)
-    embed.set_footer(text=f'Kanal ID: {channel.id}')
-    await erensi_log_gonder(guild, embed)
-
-    if (
-        not guvenlik_aktif
-        or any(k in channel.name for k in TICKET_KANAL_KEYWORDS)
-        or not olusturan_user
-    ):
-        return
-
-    if (
-        olusturan_user.bot
-        or olusturan_user == guild.owner
-        or olusturan_user.id == BOT_SAHIBI_ID
-        or is_whitelisted(guild.id, olusturan_user, 'Channel-Create')
-    ):
-        return
-
-    user_id = olusturan_user.id
-    kanal_olusturma_gecmisi.setdefault(user_id, [])
-    kanal_olusturma_gecmisi[user_id] = [
-        t for t in kanal_olusturma_gecmisi[user_id] if simdi - t < 10.0
-    ]
-    kanal_olusturma_gecmisi[user_id].append(simdi)
-
-    try:
-        await channel.delete(reason='Guard: İzinsiz spam kanal açıldı.')
-    except Exception:
-        pass
-
-    if len(kanal_olusturma_gecmisi[user_id]) >= 2:
-        await ceza_uygula(
-            guild,
-            olusturan_user,
-            '10 saniyede 2+ izinsiz kanal açtı!',
-            'Channel-Create',
-            channel.name,
-        )
-
-
-# 4. Kanal Silme Logu & Guard
-@bot.event
-async def on_guild_channel_delete(channel):
-    guild = channel.guild
-    simdi = datetime.now(timezone.utc).timestamp()
-    await asyncio.sleep(0.3)
-
-    yapan_kisi = 'Bilinmiyor'
-    silen_user = None
-
-    try:
-        async for entry in guild.audit_logs(
-            action=discord.AuditLogAction.channel_delete, limit=1
-        ):
-            if (
-                datetime.now(timezone.utc) - entry.created_at
-            ).total_seconds() < 5.0 and entry.target.id == channel.id:
-                silen_user = entry.user
-                yapan_kisi = (
-                    f'{entry.user.mention} (`{entry.user.name}` - `{entry.user.id}`)'
-                )
-                break
-    except Exception as e:
-        print(f'Audit log hatası (Kanal Silme): {e}')
-
-    embed = discord.Embed(
-        title='🗑️ • Bir Kanal Silindi!',
-        color=0xE74C3C,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(
-        name='Silinen Kanal:', value=f'`#{channel.name}`', inline=True
-    )
-    embed.add_field(name='Kanal ID:', value=f'`{channel.id}`', inline=True)
-    embed.add_field(name='Silen Yetkili:', value=yapan_kisi, inline=False)
-    embed.set_footer(text=f'Kanal Türü: {str(channel.type).capitalize()}')
-    await erensi_log_gonder(guild, embed)
-
-    if (
-        not guvenlik_aktif
-        or any(k in channel.name for k in TICKET_KANAL_KEYWORDS)
-        or not silen_user
-    ):
-        return
-
-    if (
-        silen_user.bot
-        or silen_user == guild.owner
-        or silen_user.id == BOT_SAHIBI_ID
-        or is_whitelisted(guild.id, silen_user, 'Channel-Delete')
-    ):
-        return
-
-    try:
-        await channel.clone(reason='Guard: Silinen kanal kurtarıldı.')
-    except Exception:
-        pass
-
-    await ceza_uygula(
-        guild,
-        silen_user,
-        f'İzinsiz kanal sildi (#{channel.name})',
-        'Channel-Delete',
-        channel.name,
-    )
-
-
-# 5. Rol Oluşturma Logu & Guard
-@bot.event
-async def on_guild_role_create(role):
-    guild = role.guild
-    await asyncio.sleep(0.3)
-
-    yapan_kisi = 'Bilinmiyor'
-    olusturan_user = None
-
-    try:
-        async for entry in guild.audit_logs(
-            action=discord.AuditLogAction.role_create, limit=1
-        ):
-            if (
-                datetime.now(timezone.utc) - entry.created_at
-            ).total_seconds() < 5.0 and entry.target.id == role.id:
-                olusturan_user = entry.user
-                yapan_kisi = (
-                    f'{entry.user.mention} (`{entry.user.name}` - `{entry.user.id}`)'
-                )
-                break
-    except Exception as e:
-        print(f'Audit log hatası (Rol Oluşturma): {e}')
-
-    embed = discord.Embed(
-        title='🛡️ • Yeni Bir Rol Oluşturuldu!',
-        color=0x2ECC71,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name='Rol Adı:', value=role.mention, inline=True)
-    embed.add_field(name='Rol ID:', value=f'`{role.id}`', inline=True)
-    embed.add_field(name='Oluşturan Yetkili:', value=yapan_kisi, inline=False)
-    embed.set_footer(text=f'Sunucu: {guild.name}')
-    await erensi_log_gonder(guild, embed)
-
-    if not guvenlik_aktif or not olusturan_user:
-        return
-
-    if (
-        olusturan_user.bot
-        or olusturan_user == guild.owner
-        or olusturan_user.id == BOT_SAHIBI_ID
-        or is_whitelisted(guild.id, olusturan_user, 'Role-Create')
-    ):
-        return
-
-    try:
-        await role.delete(reason='Guard: İzinsiz rol açıldı.')
-    except Exception:
-        pass
-    await ceza_uygula(
-        guild,
-        olusturan_user,
-        f'İzinsiz rol oluşturdu (@{role.name})',
-        'Role-Create',
-        role.name,
-    )
-
-
-# 6. Rol Silme Logu & Guard
-@bot.event
-async def on_guild_role_delete(role):
-    guild = role.guild
-    await asyncio.sleep(0.3)
-
-    yapan_kisi = 'Bilinmiyor'
-    silen_user = None
-
-    try:
-        async for entry in guild.audit_logs(
-            action=discord.AuditLogAction.role_delete, limit=1
-        ):
-            if (
-                datetime.now(timezone.utc) - entry.created_at
-            ).total_seconds() < 5.0 and entry.target.id == role.id:
-                silen_user = entry.user
-                yapan_kisi = (
-                    f'{entry.user.mention} (`{entry.user.name}` - `{entry.user.id}`)'
-                )
-                break
-    except Exception as e:
-        print(f'Audit log hatası (Rol Silme): {e}')
-
-    embed = discord.Embed(
-        title='🗑️ • Bir Rol Silindi!',
-        color=0xE74C3C,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name='Silinen Rol:', value=f'`@{role.name}`', inline=True)
-    embed.add_field(name='Rol ID:', value=f'`{role.id}`', inline=True)
-    embed.add_field(name='Silen Yetkili:', value=yapan_kisi, inline=False)
-    embed.set_footer(text=f'Sunucu: {guild.name}')
-    await erensi_log_gonder(guild, embed)
-
-    if not guvenlik_aktif or not silen_user:
-        return
-
-    if (
-        silen_user.bot
-        or silen_user == guild.owner
-        or silen_user.id == BOT_SAHIBI_ID
-        or is_whitelisted(guild.id, silen_user, 'Role-Delete')
-    ):
-        return
-
-    try:
-        await guild.create_role(
-            name=role.name,
-            permissions=role.permissions,
-            color=role.color,
-            reason='Guard: Rol geri yüklendi.',
-        )
-    except Exception:
-        pass
-    await ceza_uygula(
-        guild,
-        silen_user,
-        f'İzinsiz rol sildi (@{role.name})',
-        'Role-Delete',
-        role.name,
-    )
-
-
-# 7. Üye Rol Güncelleme Logu & Guard
-@bot.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    if before.guild is None or before.roles == after.roles:
-        return
-
-    guild = before.guild
-    alnan_roller = [r for r in before.roles if r not in after.roles]
-    eklenen_roller = [r for r in after.roles if r not in before.roles]
-
-    if eklenen_roller or alnan_roller:
-        embed = discord.Embed(
-            title='👤 • Bir Üyenin Rolleri Güncellendi!',
-            color=0x3498DB,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_author(
-            name=f'{after} ({after.id})', icon_url=after.display_avatar.url
-        )
-        embed.add_field(name='Kullanıcı:', value=after.mention, inline=False)
-        if eklenen_roller:
-            embed.add_field(
-                name='➕ Verilen Rol(ler):',
-                value=', '.join([r.mention for r in eklenen_roller]),
-                inline=False,
-            )
-        if alnan_roller:
-            embed.add_field(
-                name='➖ Alınan Rol(ler):',
-                value=', '.join([r.mention for r in alnan_roller]),
-                inline=False,
-            )
-        embed.set_footer(text=f'Kullanıcı ID: {after.id}')
-        await erensi_log_gonder(guild, embed)
-
-    if not guvenlik_aktif:
-        return
-
-    await asyncio.sleep(0.2)
-
-    if alnan_roller:
-        kritik = [
-            r
-            for r in alnan_roller
-            if r.permissions.administrator
-            or r.permissions.manage_roles
-            or r.permissions.manage_channels
-        ]
-        if kritik:
-            async for entry in guild.audit_logs(
-                action=discord.AuditLogAction.member_role_update, limit=1
-            ):
-                yapan = entry.user
-                if (
-                    yapan.bot
-                    or yapan == guild.owner
-                    or yapan.id == BOT_SAHIBI_ID
-                    or is_whitelisted(guild.id, yapan, 'Role-Update')
-                ):
-                    return
-                try:
-                    await after.add_roles(*kritik, reason='Guard: Rol iade edildi.')
-                except Exception:
-                    pass
-                await ceza_uygula(
-                    guild,
-                    yapan,
-                    f'{after.name} adlı yetkilinin rollerini çekti!',
-                    'Role-Update',
-                    after.name,
-                )
-
-    if eklenen_roller:
-        kritik_eklenen = [
-            r
-            for r in eklenen_roller
-            if r.permissions.administrator
-            or r.permissions.manage_roles
-            or r.permissions.manage_channels
-        ]
-        if kritik_eklenen:
-            async for entry in guild.audit_logs(
-                action=discord.AuditLogAction.member_role_update, limit=1
-            ):
-                yapan = entry.user
-                if (
-                    yapan.bot
-                    or yapan == guild.owner
-                    or yapan.id == BOT_SAHIBI_ID
-                    or is_whitelisted(guild.id, yapan, 'Role-Update')
-                ):
-                    return
-                try:
-                    await after.remove_roles(
-                        *kritik_eklenen, reason='Guard: İzinsiz rol alındı.'
-                    )
-                except Exception:
-                    pass
-                await ceza_uygula(
-                    guild,
-                    yapan,
-                    f'{after.name} adlı üyeye izinsiz yetki verdi!',
-                    'Role-Update',
-                    after.name,
-                )
-
-
-# 8. Üye Katılma Logu & Otorol & Bot-Add Koruması
-@bot.event
-async def on_member_join(member: discord.Member):
-    guild = member.guild
-    data = load_whitelist()
-    guild_data = data.get(str(guild.id), {})
-
-    otorol_id = guild_data.get('otorol_id')
-    if otorol_id and not member.bot:
-        rol = guild.get_role(otorol_id)
-        if rol:
+        for c in sorted(data.get('categories', []), key=lambda x: x['position']):
+            if discord.utils.get(guild.categories, name=c['name']):
+                continue
             try:
-                await member.add_roles(
-                    rol, reason='Otorol: Otomatik üye rolü verildi.'
+                await guild.create_category(c['name'], overwrites=overwrites_olustur(guild, c['overwrites']))
+            except Exception:
+                pass
+
+        for t in sorted(data.get('text_channels', []), key=lambda x: x['position']):
+            cat = discord.utils.get(guild.categories, name=t['category']) if t['category'] else None
+            if discord.utils.get(guild.text_channels, name=t['name'], category=cat):
+                continue
+            try:
+                await guild.create_text_channel(
+                    t['name'], category=cat, topic=t['topic'], nsfw=t['nsfw'],
+                    overwrites=overwrites_olustur(guild, t['overwrites']),
                 )
-            except Exception as e:
-                print(f'Otorol verilemedi: {e}')
+            except Exception:
+                pass
 
-    embed = discord.Embed(
-        title='📥 • Bir Kullanıcı Sunucuya Katıldı!',
-        color=0x2ECC71,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(
-        name='Kullanıcı:',
-        value=f'{member.mention} (`{member.name}`)',
-        inline=True,
-    )
-    embed.add_field(
-        name='Hesap Oluşturulma:',
-        value=f'<t:{int(member.created_at.timestamp())}:R>',
-        inline=True,
-    )
-    embed.add_field(
-        name='Üye Sayısı:', value=f'**{guild.member_count}**', inline=False
-    )
-    embed.set_footer(text=f'Kullanıcı ID: {member.id}')
-    await erensi_log_gonder(guild, embed)
-
-    if member.bot and guvenlik_aktif:
-        await asyncio.sleep(0.3)
-        async for entry in guild.audit_logs(
-            action=discord.AuditLogAction.bot_add, limit=1
-        ):
-            ekleyen = entry.user
-            if (
-                ekleyen != guild.owner
-                and ekleyen.id != BOT_SAHIBI_ID
-                and not is_whitelisted(guild.id, ekleyen, 'Bot-Add')
-            ):
-                try:
-                    await member.ban(reason='Guard: İzinsiz bot eklendi.')
-                except Exception:
-                    pass
-                await ceza_uygula(
-                    guild,
-                    ekleyen,
-                    f'İzinsiz bot soktu ({member.name})',
-                    'Bot-Add',
-                    member.name,
+        for v in sorted(data.get('voice_channels', []), key=lambda x: x['position']):
+            cat = discord.utils.get(guild.categories, name=v['category']) if v['category'] else None
+            if discord.utils.get(guild.voice_channels, name=v['name'], category=cat):
+                continue
+            try:
+                await guild.create_voice_channel(
+                    v['name'], category=cat, user_limit=v['user_limit'],
+                    bitrate=min(v['bitrate'], guild.bitrate_limit),
+                    overwrites=overwrites_olustur(guild, v['overwrites']),
                 )
-                return
+            except Exception:
+                pass
 
-    kanal_id = guild_data.get('gelen_giden_kanal')
-
-    inviter = 'Bilinmiyor / Özel Davet'
-    eski_davetler = davet_hafizasi.get(guild.id, {})
-    try:
-        yeni_davetler = await guild.invites()
-        for invite in yeni_davetler:
-            if invite.code in eski_davetler:
-                if invite.uses > eski_davetler[invite.code]:
-                    inviter = (
-                        invite.inviter.mention if invite.inviter else 'Bilinmiyor'
-                    )
-                    break
-        davet_hafizasi[guild.id] = {
-            invite.code: invite.uses for invite in yeni_davetler
-        }
+        await ctx.send('✅ Yedek başarıyla yüklendi ve uygulandı!')
     except Exception as e:
-        print(f'Davet kontrol hatası: {e}')
-
-    simdi = datetime.now(timezone.utc)
-    olusturulma = member.created_at
-    gun_sayisi = (simdi - olusturulma).days
-    hesap_yasi = (
-        f'{gun_sayisi // 365} Yıl {gun_sayisi % 365} Gün Önce'
-        if gun_sayisi > 365
-        else f'{gun_sayisi} Gün Önce'
-    )
-
-    if kanal_id:
-        kanal = guild.get_channel(kanal_id)
-        if kanal:
-            g_embed = discord.Embed(
-                title='Aramıza Biri Katıldı! 🎉',
-                description=(
-                    f'Hoş geldin {member.mention}!\n\n👤 **Davet Eden:**'
-                    f' {inviter}\n📅 **Hesap Yaşı:** `{hesap_yasi}`'
-                    f' (<t:{int(olusturulma.timestamp())}:R>)\n📊 **Toplam Üye:**'
-                    f' **{guild.member_count}**'
-                ),
-                color=discord.Color.green(),
-            )
-            g_embed.set_thumbnail(url=member.display_avatar.url)
-            await kanal.send(embed=g_embed)
+        await ctx.send(f'❌ Yedek yüklenirken bir hata oluştu: `{e}`')
 
 
-# 9. Üye Ayrılma / Kick Logu
-@bot.event
-async def on_member_remove(member: discord.Member):
-    guild = member.guild
-
-    embed = discord.Embed(
-        title='📤 • Bir Kullanıcı Sunucudan Ayrıldı!',
-        color=0xE67E22,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(
-        name='Kullanıcı:',
-        value=f'{member.mention} (`{member.name}`)',
-        inline=True,
-    )
-    embed.add_field(
-        name='Kalan Üye Sayısı:',
-        value=f'**{guild.member_count}**',
-        inline=True,
-    )
-    embed.set_footer(text=f'Kullanıcı ID: {member.id}')
-    await erensi_log_gonder(guild, embed)
-
-    if guvenlik_aktif:
-        await asyncio.sleep(0.3)
-        async for entry in guild.audit_logs(
-            action=discord.AuditLogAction.kick, limit=1
-        ):
-            if (
-                datetime.now(timezone.utc) - entry.created_at
-            ).total_seconds() < 5.0 and entry.target.id == member.id:
-                atan = entry.user
-                if (
-                    atan != guild.owner
-                    and atan.id != BOT_SAHIBI_ID
-                    and not is_whitelisted(member.guild.id, atan, 'Kick')
-                ):
-                    await ceza_uygula(
-                        guild,
-                        atan,
-                        f'İzinsiz üye attı (Kick: {member.name})',
-                        'Kick',
-                        member.name,
-                    )
-                break
-
-    data = load_whitelist()
-    kanal_id = data.get(str(guild.id), {}).get('gelen_giden_kanal')
-    if kanal_id:
-        kanal = guild.get_channel(kanal_id)
-        if kanal:
-            c_embed = discord.Embed(
-                title='Aramızdan Biri Ayrıldı 😢',
-                description=(
-                    f'Görüşürüz {member.mention}!\n\n📊 **Kalan Üye:**'
-                    f' **{guild.member_count}**'
-                ),
-                color=discord.Color.red(),
-            )
-            c_embed.set_thumbnail(url=member.display_avatar.url)
-            await kanal.send(embed=c_embed)
-
-
-# 10. Ban Atılma & Kaldırılma Logları
-@bot.event
-async def on_member_ban(guild: discord.Guild, user: discord.User):
-    embed = discord.Embed(
-        title='🔨 • Bir Kullanıcı Yasaklandı!',
-        color=0x992D22,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(
-        name='Yasaklanan:', value=f'{user.mention} (`{user.name}`)', inline=True
-    )
-    embed.add_field(name='Kullanıcı ID:', value=f'`{user.id}`', inline=True)
-    embed.set_footer(text=f'Sunucu: {guild.name}')
-    await erensi_log_gonder(guild, embed)
-
-    if not guvenlik_aktif:
+@bot.command()
+async def senkronla(ctx):
+    """Sadece bot sahibi: slash komutlarını bu sunucuya anında yükler."""
+    if ctx.author.id != BOT_SAHIBI_ID:
         return
-    await asyncio.sleep(0.3)
-    async for entry in guild.audit_logs(
-        action=discord.AuditLogAction.ban, limit=1
-    ):
-        if (
-            datetime.now(timezone.utc) - entry.created_at
-        ).total_seconds() < 5.0 and entry.target.id == user.id:
-            banlayan = entry.user
-            if (
-                banlayan != guild.owner
-                and banlayan.id != BOT_SAHIBI_ID
-                and not is_whitelisted(guild.id, banlayan, 'Ban')
-            ):
-                await ceza_uygula(
-                    guild,
-                    banlayan,
-                    f'İzinsiz üye banladı ({user.name})',
-                    'Ban',
-                    user.name,
-                )
-            break
+    bot.tree.copy_global_to(guild=ctx.guild)
+    s = await bot.tree.sync(guild=ctx.guild)
+    await ctx.send(f'✅ {len(s)} slash komutu bu sunucuya yüklendi.')
 
 
 @bot.event
-async def on_member_unban(guild: discord.Guild, user: discord.User):
-    embed = discord.Embed(
-        title='🔓 • Bir Kullanıcının Yasağı Kaldırıldı!',
-        color=0x1ABC9C,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(
-        name='Yasağı Açılan:',
-        value=f'{user.mention} (`{user.name}`)',
-        inline=True,
-    )
-    embed.add_field(name='Kullanıcı ID:', value=f'`{user.id}`', inline=True)
-    embed.set_footer(text=f'Sunucu: {guild.name}')
-    await erensi_log_gonder(guild, embed)
-
-
-# 11. Davet Oluşturma Logu
-@bot.event
-async def on_invite_create(invite: discord.Invite):
-    embed = discord.Embed(
-        title='📨 • Yeni Bir Davet Linki Oluşturuldu!',
-        color=0x3498DB,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name='Davet Kodu:', value=f'`{invite.code}`', inline=True)
-    embed.add_field(
-        name='Oluşturan:',
-        value=invite.inviter.mention if invite.inviter else 'Bilinmiyor',
-        inline=True,
-    )
-    embed.set_footer(text=f'Sunucu: {invite.guild.name}')
-    await erensi_log_gonder(invite.guild, embed)
-
-    if guvenlik_aktif:
-        async for entry in invite.guild.audit_logs(
-            action=discord.AuditLogAction.invite_create, limit=1
-        ):
-            yapan = entry.user
-            if (
-                yapan != invite.guild.owner
-                and yapan.id != BOT_SAHIBI_ID
-                and not is_whitelisted(invite.guild.id, yapan, 'Invite-Link')
-            ):
-                try:
-                    await invite.delete(
-                        reason='Guard: İzinsiz davet linki silindi.'
-                    )
-                except Exception:
-                    pass
-                break
-    await davetleri_guncelle(invite.guild)
-
-
-@bot.event
-async def on_invite_delete(invite: discord.Invite):
-    await davetleri_guncelle(invite.guild)
-
-
-# 12. Mesaj Takibi (YASAKLI ETİKET, LİNK & SPAM KORUMASI)
-@bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
         return
+    if isinstance(error, commands.MissingPermissions):
+        return await ctx.send('❌ Bu komut için yönetici olmalısın.')
+    print(f'Komut hatası: {error}')
 
-    if guvenlik_aktif:
-        user = message.author
-        user_id = user.id
-        simdi = datetime.now(timezone.utc).timestamp()
-        is_exempt = (
-            user == message.guild.owner
-            or user_id == BOT_SAHIBI_ID
-            or is_whitelisted(message.guild.id, user, 'All')
-        )
 
-        if not is_exempt:
-
-            if not is_whitelisted(message.guild.id, user, 'Mention'):
-                yasakli_etiket_tespit = False
-                if '@everyone' in message.content or '@here' in message.content:
-                    yasakli_etiket_tespit = True
-
-                if not yasakli_etiket_tespit and message.role_mentions:
-                    yasakli_rol_idleri = [
-                        1539361902596067458,
-                        1539361906568073236,
-                    ]
-                    for role in message.role_mentions:
-                        if role.id in yasakli_rol_idleri:
-                            yasakli_etiket_tespit = True
-                            break
-
-                if yasakli_etiket_tespit:
-                    try:
-                        await message.delete()
-                    except Exception:
-                        pass
-
-                    etiket_spam_gecmisi.setdefault(user_id, [])
-                    etiket_spam_gecmisi[user_id] = [
-                        t
-                        for t in etiket_spam_gecmisi[user_id]
-                        if simdi - t < 10.0
-                    ]
-                    etiket_spam_gecmisi[user_id].append(simdi)
-
-                    if len(etiket_spam_gecmisi[user_id]) >= 2:
-                        await ceza_uygula(
-                            message.guild,
-                            user,
-                            '10 saniyede 2+ kez izinsiz toplu/yasaklı etiket'
-                            ' attı!',
-                            'Mention',
-                            'Sohbet Kanalı',
-                        )
-                        etiket_spam_gecmisi[user_id] = []
-                    else:
-                        try:
-                            await message.channel.send(
-                                f'⚠️ {user.mention}, bu etiketi atma yetkiniz'
-                                ' yok! Tekrar ederseniz yetkileriniz'
-                                ' alınacaktır.',
-                                delete_after=4,
-                            )
-                        except Exception:
-                            pass
-                    return
-
-            if not is_whitelisted(message.guild.id, user, 'Link'):
-                if LINK_REGEX.search(message.content):
-                    try:
-                        await message.delete()
-                    except Exception:
-                        pass
-
-                    link_spam_gecmisi.setdefault(user_id, [])
-                    link_spam_gecmisi[user_id] = [
-                        t
-                        for t in link_spam_gecmisi[user_id]
-                        if simdi - t < 10.0
-                    ]
-                    link_spam_gecmisi[user_id].append(simdi)
-
-                    embed = discord.Embed(
-                        title='🔗 • Bir Reklam / Bağlantı Engellendi!',
-                        color=0xE74C3C,
-                        timestamp=datetime.now(timezone.utc),
-                    )
-                    embed.add_field(
-                        name='Kullanıcı:',
-                        value=f'{user.mention} (`{user.id}`)',
-                        inline=True,
-                    )
-                    embed.add_field(
-                        name='Kanal:',
-                        value=message.channel.mention,
-                        inline=True,
-                    )
-                    embed.add_field(
-                        name='Engellenen İçerik:',
-                        value=f'```{message.content[:500]}```',
-                        inline=False,
-                    )
-                    embed.set_footer(text=f'Kullanıcı ID: {user.id}')
-                    await erensi_log_gonder(message.guild, embed)
-
-                    if len(link_spam_gecmisi[user_id]) >= 2:
-                        await ceza_uygula(
-                            message.guild,
-                            user,
-                            '10 saniyede 2+ kez izinsiz bağlantı/link paylaştı!',
-                            'Link',
-                            'Sohbet Kanalı',
-                        )
-                        link_spam_gecmisi[user_id] = []
-                    else:
-                        try:
-                            await message.channel.send(
-                                f'⚠️ {user.mention}, bu sunucuda bağlantı/link'
-                                ' paylaşmak yasaktır!',
-                                delete_after=4,
-                            )
-                        except Exception:
-                            pass
-                    return
-
-            mesaj_gecmisi.setdefault(user_id, [])
-            mesaj_gecmisi[user_id] = [
-                t for t in mesaj_gecmisi[user_id] if simdi - t < 3.0
-            ]
-            mesaj_gecmisi[user_id].append(simdi)
-
-            if len(mesaj_gecmisi[user_id]) >= 4:
-                try:
-                    await message.channel.purge(
-                        limit=10, check=lambda m: m.author.id == user_id
-                    )
-                    await message.channel.send(
-                        f'🚨 {user.mention}, çok hızlı mesaj attığınız için'
-                        ' mesajlarınız temizlendi!',
-                        delete_after=4,
-                    )
-                except Exception:
-                    pass
-                mesaj_gecmisi[user_id] = []
-
-    await bot.process_commands(message)
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f'Slash komut hatası ({interaction.command.name if interaction.command else "?"}): {error}')
+    mesaj = '❌ Komut çalışırken bir hata oluştu.'
+    if isinstance(error, app_commands.MissingPermissions):
+        mesaj = '❌ Bu komut için yetkin yok.'
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        mesaj = '❌ Benim bu işlem için yetkim yok.'
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(mesaj, ephemeral=True)
+        else:
+            await interaction.response.send_message(mesaj, ephemeral=True)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------
-# 11. ON READY
+# 16. KOMUT SENKRONIZASYONU (KOMUTLAR GORUNMEME SORUNUNUN COZUMU)
 # ---------------------------------------------------------
+# Global sync'in Discord'da gorunmesi uzun surebiliyor / onbellekte takiliyor.
+# Bu yuzden komutlari HER SUNUCUYA ayri ayri yukluyoruz (anında görünür),
+# eski global kopyalari da siliyoruz ki komutlar cift gorunmesin.
+async def sunucuya_komut_yukle(guild: discord.Guild):
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        s = await bot.tree.sync(guild=guild)
+        print(f'✅ {guild.name}: {len(s)} slash komutu yüklendi.')
+    except Exception as e:
+        print(f'❌ {guild.name} komut yükleme hatası: {e}')
+
+
+senkron_yapildi = False
+
+
 @bot.event
 async def on_ready():
-    bot.add_view(TicketView())
-    bot.add_view(TicketKapatView())
-
-    for guild in bot.guilds:
-        await davetleri_guncelle(guild)
+    global senkron_yapildi
+    if not senkron_yapildi:
+        senkron_yapildi = True
+        for g in bot.guilds:
+            await sunucuya_komut_yukle(g)
         try:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(
-                f'BAŞARILI: "{guild.name}" sunucusu için {len(synced)} komut'
-                ' eşitlendi.'
-            )
+            await bot.http.bulk_upsert_global_commands(bot.application_id, [])
         except Exception as e:
-            print(f'Eşitleme hatası ({guild.name}): {e}')
+            print(f'Global komut temizleme hatası: {e}')
 
-    print(f'🚀 {bot.user} Koruma ve Erensi Tarzı Log Sistemi 7/24 Aktif!')
+    for g in bot.guilds:
+        await davetleri_guncelle(g)
+
+    print(f'Bot aktif: {bot.user.name} ({bot.user.id})')
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    await sunucuya_komut_yukle(guild)
+    await davetleri_guncelle(guild)
 
 
 # ---------------------------------------------------------
-# 12. BAŞLATMA DÖNGÜSÜ
+# 17. CALISTIR
 # ---------------------------------------------------------
 if __name__ == '__main__':
     keep_alive()
-
     TOKEN = os.environ.get('DISCORD_TOKEN')
-
     if TOKEN:
         bot.run(TOKEN)
     else:
-        print("❌ HATA: 'DISCORD_TOKEN' çevre değişkeni bulunamadı!")
+        print('❌ HATA: DISCORD_TOKEN çevresel değişkeni bulunamadı!')
